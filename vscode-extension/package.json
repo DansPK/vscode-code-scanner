@@ -1,0 +1,147 @@
+{
+  "name": "vuln-scanner",
+  "displayName": "Vuln Scanner",
+  "description": "Scan your code for vulnerabilities with a self-hosted scanner harness, and chat about the findings.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Linters",
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onUri"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "vulnScanner.setToken",
+        "title": "Set Token",
+        "category": "Vuln Scanner"
+      },
+      {
+        "command": "vulnScanner.clearToken",
+        "title": "Clear Token",
+        "category": "Vuln Scanner"
+      },
+      {
+        "command": "vulnScanner.openChat",
+        "title": "Open Chat",
+        "category": "Vuln Scanner"
+      },
+      {
+        "command": "vulnScanner.newSession",
+        "title": "New Session",
+        "category": "Vuln Scanner"
+      },
+      {
+        "command": "vulnScanner.scanWorkspace",
+        "title": "Scan Workspace",
+        "category": "Vuln Scanner"
+      },
+      {
+        "command": "vulnScanner.rescan",
+        "title": "Rescan",
+        "category": "Vuln Scanner"
+      },
+      {
+        "command": "vulnScanner.cancelScan",
+        "title": "Cancel Scan",
+        "category": "Vuln Scanner"
+      }
+    ],
+    "configuration": {
+      "title": "Vuln Scanner",
+      "properties": {
+        "vulnScanner.serverUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL of the scanner harness, for example https://scanner.example.com"
+        },
+        "vulnScanner.token": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Paste your token here to sign in. The extension moves it into VS Code's secure storage and clears this field, so it does not stay in your settings file. (Same as running **Vuln Scanner: Set Token**.)"
+        },
+        "vulnScanner.caCertificate": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to a PEM certificate to trust for HTTPS, for example the harness's self-signed `certs/dev-cert.pem`. Trusted in addition to the normal certificates. `~` is allowed."
+        },
+        "vulnScanner.maxFileSizeKB": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 1,
+          "description": "Files larger than this are skipped."
+        },
+        "vulnScanner.maxUploadMB": {
+          "type": "number",
+          "default": 200,
+          "minimum": 1,
+          "description": "Stop before uploading an archive larger than this."
+        },
+        "vulnScanner.extraExcludes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra glob patterns to skip (gitignore syntax)."
+        },
+        "vulnScanner.showLikelyFalsePositives": {
+          "type": "boolean",
+          "default": false,
+          "description": "Show findings the LLM marked as likely false alarms."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "vulnScanner",
+          "title": "Vuln Scanner",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "vulnScanner": [
+        {
+          "type": "webview",
+          "id": "vulnScanner.chat",
+          "name": "Chat"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "compile-tests": "tsc -p tsconfig.test.json",
+    "test:unit": "npm run compile-tests && node --test \"out/test/unit/**/*.test.js\"",
+    "test:integration": "npm run build && npm run compile-tests && node out/test/integration/runTest.js",
+    "test": "npm run test:unit && npm run test:integration",
+    "fake-server": "npm run compile-tests && node out/test/fakeServer.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "ignore": "^7.0.12",
+    "markdown-it": "^15.0.2",
+    "tar": "^7.5.22",
+    "undici": "^7.30.0"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.2.0",
+    "@types/node": "^22.20.5",
+    "@types/vscode": "~1.90.0",
+    "@vscode/test-electron": "^3.1.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3"
+  }
+}

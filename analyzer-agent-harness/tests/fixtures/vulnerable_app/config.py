@@ -1,0 +1,3 @@
+# Planted problem: hard-coded API key
+STRIPE_API_KEY = "sk_live_51HxQz8Kd93kfJd8s7Hq2LmNpQ4rStUvWxYz012345"
+AWS_ACCESS_KEY_ID = "AKIAZ7Q4XK3P9T2WLM5D"

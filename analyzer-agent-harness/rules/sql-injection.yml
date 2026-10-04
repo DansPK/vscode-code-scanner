@@ -1,0 +1,79 @@
+# Our own SQL injection rules. Semgrep's free rules miss most JavaScript/TypeScript cases and
+# queries assembled in one function and run in another; SonarQube Community Edition has no
+# SQL injection taint analysis at all. These rules are deliberately broad: the LLM review
+# marks the harmless matches as likely false alarms.
+rules:
+  - id: harness.js.sql-injection.sql-built-from-variables
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      SQL text is built from a variable (template literal or string concatenation). If any part
+      comes from user input, this is SQL injection. Pass values as query parameters instead
+      ($1 / ? placeholders, or the library's tagged template such as Prisma's $queryRaw`...`).
+    metadata:
+      cwe: ["CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"]
+      category: security
+      confidence: MEDIUM
+      # The harness keeps a match only if the matched text itself looks like SQL (see semgrep.py).
+      harness-sql-text: true
+    patterns:
+      - pattern-either:
+          - pattern: "`...${$X}...`"
+          - pattern: '"$SQL" + $X'
+          - pattern: "'$SQL' + $X"
+          - pattern: '$X + "$SQL"'
+          - pattern: "$X + '$SQL'"
+      - pattern-not-inside: $TAG`...`
+
+  - id: harness.js.sql-injection.raw-query-with-variable
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      A raw SQL query is run with a query string that is not a fixed literal. If it contains user
+      input, this is SQL injection. Use parameters, or Prisma's tagged $queryRaw`...` instead of
+      the *Unsafe variants.
+    metadata:
+      cwe: ["CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"]
+      category: security
+      confidence: MEDIUM
+    patterns:
+      - pattern-either:
+          - pattern: $DB.$queryRawUnsafe($Q, ...)
+          - pattern: $DB.$executeRawUnsafe($Q, ...)
+          - pattern: $DB.raw($Q, ...)
+          - pattern: $DB.unsafe($Q, ...)
+          - pattern: $DB.query($Q, ...)
+          - pattern: $DB.execute($Q, ...)
+      - pattern-not: $DB.$M("...", ...)
+      - pattern-not: $DB.$M('...', ...)
+      - pattern-not: $DB.$M(`...`, ...)
+      - metavariable-pattern:
+          metavariable: $Q
+          patterns:
+            - pattern-not: |
+                "..."
+            - pattern-not: |
+                '...'
+            - pattern-not: "`...`"
+      - metavariable-regex:
+          metavariable: $DB
+          regex: (?i).*(db|pool|client|conn|connection|knex|sequelize|prisma|sql|pg|mysql|tx|trx|manager|datasource|repository|queryrunner).*
+
+  - id: harness.java.sql-injection.sql-built-from-variables
+    languages: [java]
+    severity: WARNING
+    message: >-
+      SQL text is built by joining strings with a variable. If any part comes from user input and
+      the string is run as a query, this is SQL injection. Use a PreparedStatement with ?
+      placeholders, or named parameters in JPA/Spring.
+    metadata:
+      cwe: ["CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"]
+      category: security
+      confidence: LOW
+    patterns:
+      - pattern-either:
+          - pattern: '"$SQL" + $X'
+          - pattern: String.format("$SQL", ...)
+      - metavariable-regex:
+          metavariable: $SQL
+          regex: (?is).*\b(select\b.+\bfrom|insert\s+into|update\s+\w+\s+set|delete\s+from|order\s+by|where\s+\w+\s*(=|like|in\b)).*

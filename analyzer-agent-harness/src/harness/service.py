@@ -1,0 +1,340 @@
+"""Tool logic from the contract, independent of MCP. Every method takes the caller's user id."""
+
+import asyncio
+import errno
+import json
+import logging
+import re
+import secrets
+import shutil
+import tempfile
+from pathlib import Path
+
+from harness import chat as chat_mod
+from harness import uploads
+from harness.db import now
+from harness.files import PathError, check_rel_path
+from harness.scanners import sonarqube
+from harness.scanners.findings import SEVERITIES, TOOLS
+
+log = logging.getLogger(__name__)
+
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+MAX_NAME = 200
+MAX_CHAT_CHARS = 8000
+MAX_MANIFEST_ENTRIES = 200_000
+MAX_FINDINGS_PAGE = 1000
+
+
+class UserError(Exception):
+    """An error whose message is shown to the user as-is."""
+
+
+class Service:
+    def __init__(self, cfg, db, scans, llm, sonar_client=None, github=None):
+        self.cfg = cfg
+        self.db = db
+        self.scans = scans
+        self.llm = llm
+        self.sonar = sonar_client or sonarqube.SonarClient(cfg.sonar_host_url, cfg.sonar_token)
+        self.github = github  # set in Milestone 5
+        self._session_locks = {}
+
+    # --- helpers ---
+
+    def _session(self, user, session_id):
+        row = self.db.one("SELECT * FROM sessions WHERE id=? AND owner=?", (str(session_id), user))
+        if row is None:
+            raise UserError("session not found")
+        return row
+
+    def _scan(self, user, scan_id):
+        row = self.db.one("SELECT s.* FROM scans s JOIN sessions x ON x.id = s.session_id "
+                          "WHERE s.id=? AND x.owner=?", (str(scan_id), user))
+        if row is None:
+            raise UserError("scan not found")
+        return row
+
+    def session_dir(self, session_id):
+        return self.cfg.sessions_dir / session_id
+
+    def code_dir(self, session_id):
+        return self.session_dir(session_id) / "code"
+
+    def _lock(self, session_id):
+        return self._session_locks.setdefault(session_id, asyncio.Lock())
+
+    def _manifest(self, session_id):
+        return {r["path"]: r for r in self.db.all(
+            "SELECT path, sha256, size FROM manifest_files WHERE session_id=?", (session_id,))}
+
+    def _set_manifest(self, session_id, entries):
+        with self.db.conn() as c:
+            c.execute("DELETE FROM manifest_files WHERE session_id=?", (session_id,))
+            c.executemany("INSERT INTO manifest_files VALUES (?,?,?,?)",
+                          [(session_id, e["path"], e["sha256"], e["size"]) for e in entries])
+
+    # --- sessions ---
+
+    def create_session(self, user, name=None, target_type="workspace", repo_url=None):
+        if target_type not in ("workspace", "github"):
+            raise UserError("target_type must be 'workspace' or 'github'")
+        if target_type == "github":
+            if not repo_url:
+                raise UserError("repo_url is required for a github session")
+            from harness import github
+            owner, repo = github.parse_url(repo_url)
+            repo_url = f"https://github.com/{owner}/{repo}"
+            name = name or f"{owner}/{repo}"
+        else:
+            repo_url = None
+        name = (name or f"Workspace scan {now()[:16].replace('T', ' ')}").strip()[:MAX_NAME]
+        sid = secrets.token_hex(12)
+        ts = now()
+        self.db.run("INSERT INTO sessions (id, owner, name, target_type, repo_url, created_at, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)", (sid, user, name, target_type, repo_url, ts, ts))
+        self.code_dir(sid).mkdir(parents=True, exist_ok=True)
+        log.info("session created: %s", sid)
+        return {"session_id": sid}
+
+    def _session_fields(self, row):
+        last = self.db.one("SELECT created_at, status FROM scans WHERE session_id=? "
+                           "ORDER BY created_at DESC, rowid DESC LIMIT 1", (row["id"],))
+        return {"session_id": row["id"], "name": row["name"], "target_type": row["target_type"],
+                "repo_url": row["repo_url"], "created_at": row["created_at"],
+                "last_scan_at": last["created_at"] if last else None,
+                "last_scan_status": last["status"] if last else None}
+
+    def list_sessions(self, user):
+        rows = self.db.all("SELECT * FROM sessions WHERE owner=? ORDER BY updated_at DESC", (user,))
+        return {"sessions": [self._session_fields(r) for r in rows]}
+
+    def get_session(self, user, session_id, message_limit=50):
+        row = self._session(user, session_id)
+        limit = max(0, min(int(message_limit), 500))
+        msgs = self.db.all("SELECT role, text, finding_ids, created_at FROM messages WHERE session_id=? "
+                           "ORDER BY id DESC LIMIT ?", (row["id"], limit))
+        latest = self.db.one("SELECT id FROM scans WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                             (row["id"],))
+        count = self.db.one("SELECT COUNT(*) AS n FROM manifest_files WHERE session_id=?", (row["id"],))["n"]
+        return {"session": self._session_fields(row),
+                "messages": [{**m, "finding_ids": json.loads(m["finding_ids"])} for m in reversed(msgs)],
+                "latest_scan_id": latest["id"] if latest else None, "file_count": count}
+
+    def rename_session(self, user, session_id, name):
+        row = self._session(user, session_id)
+        name = (name or "").strip()
+        if not name:
+            raise UserError("name must not be empty")
+        self.db.run("UPDATE sessions SET name=?, updated_at=? WHERE id=?", (name[:MAX_NAME], now(), row["id"]))
+        return {"ok": True}
+
+    async def delete_session(self, user, session_id):
+        row = self._session(user, session_id)
+        sid = row["id"]
+        await self.scans.cancel_session(sid)
+        with self.db.conn() as c:
+            for table in ("messages", "manifest_files", "pending_manifests", "uploads", "findings", "scans"):
+                c.execute(f"DELETE FROM {table} WHERE session_id=?", (sid,))
+            c.execute("DELETE FROM sessions WHERE id=?", (sid,))
+        await asyncio.to_thread(shutil.rmtree, self.session_dir(sid), True)
+        await self.sonar.delete_project(sonarqube.project_key(sid))
+        log.info("session deleted: %s", sid)
+        return {"ok": True}
+
+    # --- sync and upload ---
+
+    def sync_files(self, user, session_id, manifest):
+        row = self._session(user, session_id)
+        if row["target_type"] != "workspace":
+            raise UserError("sync_files is only for workspace sessions")
+        if not isinstance(manifest, list) or len(manifest) > MAX_MANIFEST_ENTRIES:
+            raise UserError("manifest must be a list of at most %d entries" % MAX_MANIFEST_ENTRIES)
+        entries, seen = [], set()
+        for e in manifest:
+            try:
+                path = check_rel_path(e.get("path"))
+            except (PathError, AttributeError) as err:
+                raise UserError(str(err)) from err
+            sha, size = e.get("sha256"), e.get("size")
+            if not isinstance(sha, str) or not SHA_RE.match(sha):
+                raise UserError(f"bad sha256 for {path}")
+            if not isinstance(size, int) or size < 0:
+                raise UserError(f"bad size for {path}")
+            if path in seen:
+                raise UserError(f"duplicate path {path}")
+            seen.add(path)
+            entries.append({"path": path, "sha256": sha, "size": size})
+        current = self._manifest(row["id"])
+        need = [e["path"] for e in entries if current.get(e["path"], {}).get("sha256") != e["sha256"]]
+        delete = sorted(set(current) - seen)
+        self.db.run("INSERT OR REPLACE INTO pending_manifests VALUES (?,?,?)",
+                    (row["id"], json.dumps(entries), now()))
+        return {"need": need, "delete": delete, "unchanged_count": len(entries) - len(need)}
+
+    def request_upload(self, user, session_id, size_bytes, sha256):
+        row = self._session(user, session_id)
+        if row["target_type"] != "workspace":
+            raise UserError("request_upload is only for workspace sessions")
+        if not isinstance(size_bytes, int) or size_bytes <= 0:
+            raise UserError("size_bytes must be a positive integer")
+        if size_bytes > self.cfg.upload_max_mb * 1024 * 1024:
+            raise UserError(f"archive is larger than the server limit of {self.cfg.upload_max_mb} MB")
+        if not isinstance(sha256, str) or not SHA_RE.match(sha256):
+            raise UserError("sha256 must be 64 lowercase hex characters")
+        upload_id, url, expires = uploads.create(self.cfg, self.db, row["id"], size_bytes, sha256)
+        from datetime import datetime, timezone
+        return {"upload_id": upload_id, "upload_url": url,
+                "expires_at": datetime.fromtimestamp(expires, timezone.utc).isoformat(timespec="seconds")}
+
+    def _apply_upload(self, sid, upload_id, deleted_paths):
+        """Make the pending manifest current: unpack the upload, delete removed files.
+        Returns (all paths, changed paths). Runs in a worker thread."""
+        current = self._manifest(sid)
+        pending_row = self.db.one("SELECT manifest FROM pending_manifests WHERE session_id=?", (sid,))
+        if pending_row is None:
+            if upload_id:
+                raise UserError("call sync_files before uploading")
+            return sorted(current), set()
+        pending = {e["path"]: e for e in json.loads(pending_row["manifest"])}
+        need = {p for p, e in pending.items() if current.get(p, {}).get("sha256") != e["sha256"]}
+        if len(deleted_paths or []) > MAX_MANIFEST_ENTRIES:
+            raise UserError("too many deleted paths")
+        for p in deleted_paths or []:
+            check_rel_path(p)
+        to_delete = (set(current) | set(deleted_paths or [])) - set(pending)
+        code = self.code_dir(sid)
+        code.mkdir(parents=True, exist_ok=True)
+
+        written = []
+        staging = None
+        if need:
+            if not upload_id:
+                raise UserError(f"{len(need)} files changed; upload them first")
+            archive = uploads.take(self.db, upload_id, sid)
+            staging = Path(tempfile.mkdtemp(dir=self.session_dir(sid), prefix="staging-"))
+            try:
+                written = uploads.unpack(archive, staging,
+                                         {p: pending[p]["sha256"] for p in need},
+                                         self.cfg.upload_max_unpacked_mb * 1024 * 1024)
+                missing = need - set(written)
+                if missing:
+                    raise UserError(f"the upload is missing {len(missing)} changed files, "
+                                    f"for example {sorted(missing)[0]}")
+            except (uploads.UnpackError, UserError):
+                shutil.rmtree(staging, ignore_errors=True)
+                raise
+        try:
+            for p in sorted(to_delete, reverse=True):
+                target = code / p
+                if target.is_symlink() or target.is_file():
+                    target.unlink()
+                elif target.is_dir():
+                    shutil.rmtree(target)
+            if staging:
+                uploads.move_into(staging, code, written)
+        finally:
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
+        self._set_manifest(sid, list(pending.values()))
+        self.db.run("DELETE FROM pending_manifests WHERE session_id=?", (sid,))
+        if upload_id:
+            uploads.discard(self.db, upload_id)
+        return sorted(pending), need
+
+    # --- scans ---
+
+    async def start_scan(self, user, session_id, upload_id=None, deleted_paths=None, full=False):
+        row = self._session(user, session_id)
+        sid = row["id"]
+        async with self._lock(sid):
+            if self.scans.is_running(sid):
+                raise UserError("a scan is already running for this session")
+            web_base = None
+            if row["target_type"] == "workspace":
+                try:
+                    files, changed = await asyncio.to_thread(self._apply_upload, sid, upload_id, deleted_paths)
+                except (uploads.UnpackError, PathError) as e:
+                    raise UserError(str(e)) from e
+                except OSError as e:
+                    if e.errno == errno.ENOSPC:
+                        raise UserError("The server disk is full.") from e
+                    raise
+            else:
+                if self.github is None:
+                    raise UserError("GitHub scans are not available")
+                files, changed, web_base = await self.github.prepare(row, self.code_dir(sid))
+            if not files:
+                raise UserError("there are no files to scan")
+            scan_id = self.scans.start(row, {"files": files, "changed": changed, "full": bool(full),
+                                             "web_base": web_base})
+        return {"scan_id": scan_id}
+
+    def get_scan_status(self, user, scan_id):
+        return self.scans.status(self._scan(user, scan_id)["id"])
+
+    async def watch_scan(self, user, scan_id, report):
+        return await self.scans.watch(self._scan(user, scan_id)["id"], report)
+
+    async def cancel_scan(self, user, scan_id):
+        row = self._scan(user, scan_id)
+        if row["status"] not in ("queued", "running"):
+            raise UserError(f"the scan is already {row['status']}")
+        await self.scans.cancel(row["id"])
+        return {"ok": True}
+
+    def _latest_scan_id(self, sid):
+        row = self.scans.latest_done(sid)
+        return row["id"] if row else None
+
+    def get_findings(self, user, session_id, scan_id=None, severity=None, tool=None, path=None,
+                     limit=200, offset=0):
+        row = self._session(user, session_id)
+        if scan_id:
+            scan = self._scan(user, scan_id)
+            if scan["session_id"] != row["id"]:
+                raise UserError("scan not found")
+        else:
+            scan_id = self._latest_scan_id(row["id"])
+            if scan_id is None:
+                return {"findings": [], "total": 0}
+        for s in severity or []:
+            if s not in SEVERITIES:
+                raise UserError(f"unknown severity {s}")
+        for t in tool or []:
+            if t not in TOOLS:
+                raise UserError(f"unknown tool {t}")
+        found = [f for f in self.db.load_findings(scan_id)
+                 if (not severity or f["severity"] in severity)
+                 and (not tool or set(tool) & set(f["tools"]))
+                 and (not path or f["path"] == path or f["path"].startswith(path.rstrip("/") + "/"))]
+        found.sort(key=lambda f: (SEVERITIES.index(f["severity"]), f["path"], f["start_line"]))
+        limit = max(1, min(int(limit), MAX_FINDINGS_PAGE))
+        offset = max(0, int(offset))
+        return {"findings": found[offset:offset + limit], "total": len(found)}
+
+    # --- chat ---
+
+    async def chat(self, user, session_id, message):
+        row = self._session(user, session_id)
+        message = (message or "").strip()
+        if not message:
+            raise UserError("message must not be empty")
+        if len(message) > MAX_CHAT_CHARS:
+            raise UserError(f"message is too long (limit {MAX_CHAT_CHARS} characters)")
+        sid = row["id"]
+        history = self.db.all("SELECT role, text FROM messages WHERE session_id=? ORDER BY id DESC LIMIT ?",
+                              (sid, chat_mod.HISTORY_MESSAGES))[::-1]
+        scan_id = self._latest_scan_id(sid)
+        findings = self.db.load_findings(scan_id, with_masks=True) if scan_id else []
+        ws = chat_mod.Workspace(self.code_dir(sid), findings)
+        from harness.llm import LLMError
+        try:
+            reply, ids = await chat_mod.chat(self.llm, ws, message, history, self.cfg.llm_tool_calling)
+        except LLMError as e:
+            raise UserError(str(e)) from e
+        ts = now()
+        self.db.many("INSERT INTO messages (session_id, role, text, finding_ids, created_at) VALUES (?,?,?,?,?)",
+                     [(sid, "user", message, "[]", ts), (sid, "assistant", reply, json.dumps(ids), ts)])
+        self.db.run("UPDATE sessions SET updated_at=? WHERE id=?", (ts, sid))
+        return {"reply": reply, "finding_ids": ids}

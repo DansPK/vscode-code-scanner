@@ -1,0 +1,33 @@
+[project]
+name = "harness"
+version = "0.1.0"
+description = "Vulnerability scanner harness (MCP server)"
+authors = [
+    { name = "Nut Youlong", email = "Nutyoulong@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "litellm>=1.104.0",
+    "mcp>=2.3.0",
+    "starlette>=1.7.0",
+    "uvicorn>=0.54.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[project.scripts]
+harness = "harness.app:main"
+harness-token = "harness.auth:cli"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

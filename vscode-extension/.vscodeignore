@@ -1,0 +1,12 @@
+src/**
+test/**
+out/**
+webview/**/*.ts
+node_modules/**
+.vscode-test/**
+tsconfig*.json
+esbuild.mjs
+**/*.map
+IMPLEMENT_*.md
+PLAN_QUESTIONS.md
+.gitignore

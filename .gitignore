@@ -1,0 +1,23 @@
+# Secrets and local config
+.env
+*.pem
+certs/
+analyzer-agent-harness/.env
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+analyzer-agent-harness/.bin/
+analyzer-agent-harness/data/
+
+# Node / VS Code extension
+node_modules/
+vscode-extension/dist/
+vscode-extension/out/
+vscode-extension/.vscode-test/
+*.vsix
+
+# OS / editors
+.DS_Store
