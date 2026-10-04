@@ -110,3 +110,53 @@ async def test_folders_the_user_never_named_are_dropped(cfg):
     assert d["paths"] == []
     d = await intent.decide(LLM(cfg, fake), "only scan the backend api", session, FILES, True, False)
     assert d["paths"] == ["Kasephal-API"]
+
+
+async def test_generic_words_are_not_folders(cfg):
+    from fakes import FakeLLMCompletion
+    from harness.llm import LLM
+    session = {"target_type": "workspace", "repo_url": None}
+    for msg, paths in [("scan the project", ["project"]), ("scan my code", ["code"]),
+                       ("scan this whole workspace", ["workspace", "whole"]), ("check the app", ["app"])]:
+        fake = FakeLLMCompletion(intents=[{"action": "scan", "paths": paths}])
+        d = await intent.decide(LLM(cfg, fake), msg, session, [], False, False)
+        assert d["paths"] == [], msg
+    fake = FakeLLMCompletion(intents=[{"action": "scan", "paths": ["Kasephal-API"]}])
+    d = await intent.decide(LLM(cfg, fake), "scan the Kasephal-API project", session, FILES, True, False)
+    assert d["paths"] == ["Kasephal-API"]
+
+
+async def test_bad_folder_fails_before_the_upload_is_applied(harness_server, tokens, vuln_app):
+    from flow import archive, manifest, upload
+    async with connect(harness_server.url, tokens["alice"]) as c:
+        sid = (await call(c, "create_session", {}))["session_id"]
+        s = await call(c, "sync_files", {"session_id": sid, "manifest": manifest(vuln_app)})
+        up, _ = await upload(c, sid, archive(vuln_app, s["need"]))
+        with pytest.raises(RuntimeError, match="no files under 'project'"):
+            await call(c, "start_scan", {"session_id": sid, "upload_id": up["upload_id"], "paths": ["project"]})
+        # Nothing was applied, so the same upload can still be used for a normal scan.
+        assert (await call(c, "get_session", {"session_id": sid}))["file_count"] == 0
+        scan = await call(c, "start_scan", {"session_id": sid, "upload_id": up["upload_id"]})
+        assert scan["scan_id"]
+
+
+async def test_full_only_when_asked(cfg):
+    from fakes import FakeLLMCompletion
+    from harness.llm import LLM
+    session = {"target_type": "workspace", "repo_url": None}
+    for msg, want in [("scan the project", False), ("rescan please", False), ("scan everything again from scratch", True),
+                      ("do a full scan", True), ("rescan all files", True)]:
+        fake = FakeLLMCompletion(intents=[{"action": "scan", "full": True}])
+        d = await intent.decide(LLM(cfg, fake), msg, session, [], True, False)
+        assert d["full"] is want, msg
+
+
+async def test_plain_commands_are_sure(cfg):
+    from fakes import FakeLLMCompletion
+    from harness.llm import LLM
+    session = {"target_type": "workspace", "repo_url": None}
+    for msg, want in [("rescan", True), ("please scan the project", True), ("stop", True),
+                      ("is my login code safe?", False)]:
+        fake = FakeLLMCompletion(intents=[{"action": "cancel" if msg == "stop" else "scan", "sure": False}])
+        d = await intent.decide(LLM(cfg, fake), msg, session, [], True, False)
+        assert d["sure"] is want, msg

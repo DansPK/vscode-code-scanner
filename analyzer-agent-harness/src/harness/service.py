@@ -269,6 +269,11 @@ class Service:
             if self.scans.is_running(sid):
                 raise UserError("a scan is already running for this session")
             web_base = None
+            if row["target_type"] == "workspace" and paths:
+                # Check the folders against the files being uploaded before anything is applied.
+                pending = self.db.one("SELECT manifest FROM pending_manifests WHERE session_id=?", (sid,))
+                upcoming = [e["path"] for e in json.loads(pending["manifest"])] if pending else list(self._manifest(sid))
+                self._scope(paths, upcoming)
             if row["target_type"] == "workspace":
                 try:
                     files, changed = await asyncio.to_thread(self._apply_upload, sid, upload_id, deleted_paths)

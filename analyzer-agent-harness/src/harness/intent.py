@@ -128,18 +128,42 @@ def parse(text):
 
 async def decide(llm, message, session, files, has_scan, running, history=()):
     """Ask the model what the message wants. Unreadable answers count as "none" (just chat)."""
-    messages = [{"role": "system", "content": SYSTEM + "\n" + _context(session, project_folders(files), has_scan, running)}]
-    for m in list(history)[-4:]:  # a little context, e.g. "yes" after "Shall I scan?"
-        messages.append({"role": m["role"], "content": m["text"][:500]})
-    messages.append({"role": "user", "content": message})
+    # No chat history here: small models copy earlier replies ("Starting a scan...") and misroute.
+    # Confirmations go through Yes/No buttons, so the message alone is enough to decide.
+    messages = [{"role": "system", "content": SYSTEM + "\n" + _context(session, project_folders(files), has_scan, running)},
+                {"role": "user", "content": message}]
     reply = await llm.complete(messages)
     decision = parse(reply.get("content"))
     if decision is None:
         log.info("intent reply was not readable; treating the message as chat")
         return {"action": "none", "full": False, "paths": [], "url": None, "sure": True}
-    decision["paths"] = [p for p in decision["paths"] if _mentioned(p, message)]
+    decision["paths"] = [p for p in decision["paths"] if not _is_generic(p) and _mentioned(p, message)]
+    # Plain scan commands are never a guess, whatever the model says about being sure.
+    if decision["action"] in ("scan", "scan_workspace", "scan_github", "cancel") and CLEAR_COMMAND.search(message):
+        decision["sure"] = True
+    # Same for "full": small models set it for any scan. Keep it only if the user asked for it.
+    decision["full"] = decision["full"] and bool(FULL_WORDS.search(message))
     log.info("intent: %s", json.dumps({k: v for k, v in decision.items() if k != "url"}))
     return decision
+
+
+# Words that mean "the whole thing", never a folder: "scan the project" is not paths=["project"].
+GENERIC = {"project", "projects", "code", "codebase", "source", "workspace", "repo", "repository", "app",
+           "application", "everything", "all", "files", "file", "folder", "folders", "this", "it", "my",
+           "whole", "entire", "current", "local", "root"}
+
+
+FULL_WORDS = re.compile(r"(?i)\b(from scratch|full(y)?\b|everything again|all (the )?files|start over|from the (start|beginning)"
+                        r"|re-?scan everything|scan everything|complete (re)?scan|ignore (the )?cache|whole thing again)")
+
+
+CLEAR_COMMAND = re.compile(r"(?i)^\s*(please\s+)?(re-?scan|scan|stop|cancel|abort|check https://github\.com/)\b"
+                           r"|\bscan again\b")
+
+
+def _is_generic(path):
+    words = [w for w in re.split(r"[-_./ ]+", str(path).lower()) if w]
+    return not words or all(w in GENERIC for w in words)
 
 
 def _mentioned(path, message):
