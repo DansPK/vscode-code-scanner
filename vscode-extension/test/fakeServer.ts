@@ -9,7 +9,8 @@ import { AddressInfo } from "net";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import type { Finding, ManifestEntry, ScanSummary } from "../src/shared/contract";
+import { route } from "../src/routing";
+import type { ChatAction, Finding, ManifestEntry, ScanSummary } from "../src/shared/contract";
 
 export interface FakeOptions {
   token?: string;
@@ -42,6 +43,8 @@ export class FakeHarness {
   dropNextWatch = false;
   /** When set, the next upload is answered with this status. */
   forceUploadStatus: number | null = null;
+  /** When set, chat fails as if the LLM were down. */
+  llmDown = false;
   private server?: http.Server | https.Server;
   private timers = new Set<NodeJS.Timeout>();
 
@@ -220,10 +223,11 @@ export class FakeHarness {
       }
       case "chat": {
         const s = this.session(a.session_id);
-        const reply = `You said: **${a.message}**\n\n\`\`\`js\nconsole.log("hi")\n\`\`\``;
+        if (this.llmDown) throw new Error("The LLM cannot be reached at http://llm.invalid");
+        const { reply, action } = this.agent(s, a.message);
         s.messages.push({ role: "user", text: a.message, finding_ids: [] },
                         { role: "assistant", text: reply, finding_ids: [] });
-        return { reply, finding_ids: [] };
+        return { reply, finding_ids: [], action };
       }
     }
     throw new Error(`unknown tool ${name}`);
@@ -235,6 +239,28 @@ export class FakeHarness {
 
   set stepMs(ms: number) {
     this.opts.stepMs = ms;
+  }
+
+  /** A stand-in for the harness's agent: decides with simple rules what the message wants. */
+  private agent(s: Session, text: string): { reply: string; action: ChatAction | null } {
+    const base = { full: false, paths: [] as string[], url: null as string | null, confirm: false };
+    const running = [...this.scans.values()].some((x) => x.session_id === s.id && x.status === "running");
+    if (/^\s*(stop|cancel)\b/i.test(text)) {
+      return running ? { reply: "Stopping the scan.", action: { ...base, type: "cancel" } }
+        : { reply: "No scan is running right now.", action: null };
+    }
+    const r = route(text);
+    if (r.kind === "github") return { reply: `Scanning ${r.url}.`, action: { ...base, type: "scan_github", url: r.url } };
+    if (/\bsafe\?/i.test(text)) {
+      return { reply: "Do you want me to scan the workspace?", action: { ...base, type: "scan", confirm: true } };
+    }
+    if (r.kind === "scan" || r.kind === "rescan" || /\bscan\b/i.test(text)) {
+      const only = text.match(/\bonly (?:the )?([\w./-]+?)(?: folder)?\s*$/i);
+      const full = /from scratch|full scan/i.test(text);
+      return { reply: "Starting a scan.", action: { ...base, type: "scan", full, paths: only ? [only[1]] : [] } };
+    }
+    const reply = `You said: **${text}**\n\n\`\`\`js\nconsole.log("hi")\n\`\`\``;
+    return { reply, action: null };
   }
 
   private get step() {

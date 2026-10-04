@@ -63,6 +63,7 @@ All settings are environment variables. See the table in `IMPLEMENT_HARNESS.md` 
 - **Semgrep's free rules match patterns inside one file.** Well-structured code (for example Spring Data repositories) can give no Semgrep findings at all; SonarQube usually finds more there.
 - **One scan per session at a time.** Scans run inside the harness process; a restart marks running scans as failed.
 - **GitHub:** public repos, or private ones reachable with the server's own git credentials. Shallow clones only. The work tree is limited to `UPLOAD_MAX_UNPACKED_MB`.
+- **The chat agent decides what each message wants** (`intent.py`): one short LLM call with a JSON answer picks scan / GitHub scan / cancel / just answer, with full and folder options. The `chat` result's `action` tells the extension what to do; unsure guesses come with `confirm: true`. Folder names the user never mentioned are dropped (small models invent them), and loose names are matched to real folders ("api" → `Kasephal-API`). Tested against `deephat-v1-7b`: 13 of 14 sample messages routed right, about 1 s each.
 - **Live findings.** While a scan runs, `get_findings` with that `scan_id` returns findings as soon as each scanner finishes, and each finding's LLM fields fill in as its review completes (an empty `explanation` means "not reviewed yet"). Without `scan_id`, `get_findings` still returns the latest *finished* scan.
 - **Limits:** chat messages up to 8,000 characters; manifests up to 200,000 files; MCP requests up to 64 MB.
 

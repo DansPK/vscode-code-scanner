@@ -61,8 +61,8 @@ a { color: var(--vscode-textLink-foreground); }
 
 .sessions { display: flex; gap: 4px; }
 .sessions select, .sessions .rename { flex: 1; min-width: 0; }
-.scanbar { display: flex; gap: 4px; }
-.scanbar button { flex: 1; }
+.progress-row { display: flex; align-items: center; gap: 8px; }
+.progress-row .progress-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .progress { display: flex; flex-direction: column; gap: 3px; font-size: 0.85em; color: var(--muted); }
 .progress .track { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; }
@@ -81,6 +81,13 @@ a { color: var(--vscode-textLink-foreground); }
 .panel { display: flex; flex-direction: column; gap: 8px; flex: 1; }
 
 /* --- chat --- */
+.welcome { display: flex; flex-direction: column; gap: 6px; padding: 12px 2px 4px; }
+.welcome-title { font-weight: 600; font-size: 1.05em; }
+.examples { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.example { background: var(--vscode-editor-background); color: var(--vscode-foreground); border: 1px solid var(--border);
+           border-radius: 12px; padding: 3px 10px; font-size: 0.9em; text-align: left; }
+.example:hover:not(:disabled) { background: var(--vscode-list-hoverBackground); }
+.confirm { display: flex; gap: 6px; margin: -2px 0 2px; }
 .messages { display: flex; flex-direction: column; gap: 8px; }
 .msg { padding: 8px 10px; border-radius: var(--radius); overflow-wrap: anywhere; line-height: 1.45; }
 .msg.user { background: var(--vscode-input-background); align-self: flex-end; max-width: 88%; white-space: pre-wrap; }

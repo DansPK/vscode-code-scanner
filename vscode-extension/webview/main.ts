@@ -61,15 +61,11 @@ const renameBtn = el("button", { class: "secondary", title: "Rename session", te
 const deleteBtn = el("button", { class: "secondary", title: "Delete session", text: "Delete" });
 const sessionBar = el("div", { class: "sessions" }, sessionSelect, renameInput, newBtn, renameBtn, deleteBtn);
 
-const scanBtn = el("button", { text: "Scan" });
-const rescanBtn = el("button", { class: "secondary", text: "Rescan" });
-const cancelBtn = el("button", { class: "secondary", text: "Cancel" });
-const scanBar = el("div", { class: "scanbar" }, scanBtn, rescanBtn, cancelBtn);
-
+const stopBtn = el("button", { class: "secondary small", title: "Stop the scan", text: "Stop" });
 const progress = el("div", { class: "progress hidden" });
 const progressBar = el("div", { class: "bar" });
 const progressText = el("div", { class: "progress-text" });
-progress.append(el("div", { class: "track" }, progressBar), progressText);
+progress.append(el("div", { class: "progress-row" }, progressText, stopBtn), el("div", { class: "track" }, progressBar));
 
 const chatTab = el("button", { class: "tab", role: "tab", text: "Chat" });
 const findingsTab = el("button", { class: "tab", role: "tab" });
@@ -78,7 +74,7 @@ const tabs = el("div", { class: "tabs", role: "tablist" }, chatTab, findingsTab)
 // chat panel
 const messages = el("div", { class: "messages", role: "log", "aria-live": "polite" });
 const thinking = el("div", { class: "thinking hidden", text: "Thinking..." });
-const input = el("textarea", { rows: "2", placeholder: "Ask a question, or type \"scan this project\" or a GitHub link",
+const input = el("textarea", { rows: "2", placeholder: "Ask anything, or tell me what to scan",
                                "aria-label": "Message" });
 const sendBtn = el("button", { text: "Send" });
 const composer = el("div", { class: "composer" }, input, el("div", { class: "send-row" },
@@ -95,14 +91,39 @@ const findingsEmpty = el("div", { class: "empty" });
 const findingsPanel = el("div", { class: "panel findings-panel" },
   el("div", { class: "filters" }, chips, search), findingsNote, findingsList, findingsEmpty);
 
-document.getElementById("app")!.append(status, sessionBar, scanBar, progress, tabs, chatPanel, findingsPanel);
+// Shown while the chat is empty: what you can say. Clicking one sends it (or starts it in the box).
+const EXAMPLES: [string, boolean][] = [
+  ["Scan this project", true],
+  ["Scan only the ", false],
+  ["Scan https://github.com/", false],
+  ["What are the most serious problems?", true],
+  ["Scan everything again from scratch", true],
+];
+const welcome = el("div", { class: "welcome" },
+  el("div", { class: "welcome-title", text: "What would you like to do?" }),
+  el("div", { class: "note", text: "Just type it. I can scan your workspace, a folder, or a GitHub repo, and answer questions about the findings." }));
+const exampleList = el("div", { class: "examples" });
+for (const [text, complete] of EXAMPLES) {
+  const b = button(complete ? text : `${text}…`, "example", () => {
+    if (complete) send({ type: "send", text });
+    else {
+      input.value = text;
+      input.focus();
+      input.setSelectionRange(text.length, text.length);
+    }
+  });
+  exampleList.append(b);
+}
+welcome.append(exampleList);
+messages.before(welcome);
+
+document.getElementById("app")!.append(status, sessionBar, progress, tabs, chatPanel, findingsPanel);
 
 // --- state ---
 
 let sessions: SessionInfo[] = [];
 let current: string | null = null;
 let scanning = false;
-let busy = false;
 let connected = false;
 let findings: FindingView[] = [];
 let hiddenFalsePositives = 0;
@@ -137,11 +158,7 @@ function actionButton(action: { label: string; command: string }) {
 }
 
 function updateControls() {
-  const can = connected && !scanning && !busy;
-  scanBtn.disabled = !can;
-  rescanBtn.disabled = !can;
-  cancelBtn.disabled = !scanning;
-  cancelBtn.classList.toggle("hidden", !scanning);
+  stopBtn.classList.toggle("hidden", !scanning);
   sendBtn.disabled = !connected;
   newBtn.disabled = !connected;
   renameBtn.disabled = !connected || !current;
@@ -189,6 +206,24 @@ function renderMessage(m: ChatMessage) {
     body.textContent = m.text;
   }
   messages.append(el("div", { class: `msg ${m.role}` }, body));
+  updateWelcome();
+  messages.scrollTop = messages.scrollHeight;
+}
+
+function updateWelcome() {
+  welcome.classList.toggle("hidden", messages.childElementCount > 0);
+}
+
+const confirmRows = new Map<string, HTMLElement>();
+
+function renderConfirm(id: string, yes: string, no: string) {
+  const answer = (accept: boolean) => {
+    row.querySelectorAll("button").forEach((b) => ((b as HTMLButtonElement).disabled = true));
+    send({ type: "confirm", id, accept });
+  };
+  const row = el("div", { class: "confirm" }, button(yes, "", () => answer(true)), button(no, "secondary", () => answer(false)));
+  confirmRows.set(id, row);
+  messages.append(row);
   messages.scrollTop = messages.scrollHeight;
 }
 
@@ -244,7 +279,7 @@ function renderFindings() {
   findingsNote.classList.toggle("hidden", !notes.length);
 
   findingsList.replaceChildren();
-  findingsEmpty.textContent = total ? "No findings match the filter." : "No findings yet. Click Scan to scan this project.";
+  findingsEmpty.textContent = total ? "No findings match the filter." : "No findings yet. Ask me to scan this project in the Chat tab.";
   findingsEmpty.classList.toggle("hidden", shown.length > 0);
 
   for (const sev of SEVERITIES) {
@@ -372,9 +407,7 @@ search.addEventListener("input", () => {
 });
 chatTab.onclick = () => setTab("chat");
 findingsTab.onclick = () => setTab("findings");
-scanBtn.onclick = () => send({ type: "scan" });
-rescanBtn.onclick = () => send({ type: "rescan" });
-cancelBtn.onclick = () => send({ type: "cancel" });
+stopBtn.onclick = () => send({ type: "cancel" });
 newBtn.onclick = () => send({ type: "newSession" });
 deleteBtn.onclick = () => current && send({ type: "deleteSession", id: current });
 sessionSelect.onchange = () => sessionSelect.value && send({ type: "switchSession", id: sessionSelect.value });
@@ -407,19 +440,27 @@ window.addEventListener("message", (event: MessageEvent<ToWebview>) => {
       sessions = msg.sessions;
       if (msg.current !== current) {
         messages.replaceChildren();
+        updateWelcome();
         findings = [];
         expanded.clear();
         renderFindings();
       }
       current = msg.current;
       scanning = msg.scanning;
-      busy = msg.busy;
       renderSessions();
       updateControls();
       break;
     case "history":
       messages.replaceChildren();
       msg.messages.forEach(renderMessage);
+      updateWelcome();
+      break;
+    case "confirm":
+      renderConfirm(msg.id, msg.yes, msg.no);
+      break;
+    case "confirmDone":
+      confirmRows.get(msg.id)?.remove();
+      confirmRows.delete(msg.id);
       break;
     case "message":
       renderMessage(msg.message);
@@ -449,6 +490,7 @@ window.addEventListener("message", (event: MessageEvent<ToWebview>) => {
 });
 
 setTab(ui.tab);
+updateWelcome();
 renderFindings();
 updateControls();
 send({ type: "ready" });

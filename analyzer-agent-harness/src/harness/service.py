@@ -244,9 +244,27 @@ class Service:
 
     # --- scans ---
 
-    async def start_scan(self, user, session_id, upload_id=None, deleted_paths=None, full=False):
+    def _scope(self, paths, files):
+        """Clean up the folders/files a scan is limited to, and check each one exists."""
+        scope = []
+        for p in paths or []:
+            p = str(p).strip().removeprefix("./").strip("/")
+            if not p or p == ".":
+                return []  # the whole project
+            try:
+                check_rel_path(p)
+            except PathError as e:
+                raise UserError(str(e)) from e
+            if not any(f == p or f.startswith(p + "/") for f in files):
+                raise UserError(f"there are no files under {p!r} in this project")
+            scope.append(p)
+        return scope
+
+    async def start_scan(self, user, session_id, upload_id=None, deleted_paths=None, full=False, paths=None):
         row = self._session(user, session_id)
         sid = row["id"]
+        if len(paths or []) > 100:
+            raise UserError("too many paths")
         async with self._lock(sid):
             if self.scans.is_running(sid):
                 raise UserError("a scan is already running for this session")
@@ -266,8 +284,9 @@ class Service:
                 files, changed, web_base = await self.github.prepare(row, self.code_dir(sid))
             if not files:
                 raise UserError("there are no files to scan")
+            scope = self._scope(paths, files)
             scan_id = self.scans.start(row, {"files": files, "changed": changed, "full": bool(full),
-                                             "web_base": web_base})
+                                             "web_base": web_base, "paths": scope})
         return {"scan_id": scan_id}
 
     def get_scan_status(self, user, scan_id):
@@ -327,14 +346,67 @@ class Service:
                               (sid, chat_mod.HISTORY_MESSAGES))[::-1]
         scan_id = self._latest_scan_id(sid)
         findings = self.db.load_findings(scan_id, with_masks=True) if scan_id else []
-        ws = chat_mod.Workspace(self.code_dir(sid), findings)
+        files = list(self._manifest(sid))
+        from harness import intent
         from harness.llm import LLMError
         try:
-            reply, ids = await chat_mod.chat(self.llm, ws, message, history, self.cfg.llm_tool_calling)
+            decision = await intent.decide(self.llm, message, row, files, scan_id is not None,
+                                           self.scans.is_running(sid), history)
+            if decision["action"] == "none":
+                ws = chat_mod.Workspace(self.code_dir(sid), findings)
+                reply, ids = await chat_mod.chat(self.llm, ws, message, history, self.cfg.llm_tool_calling)
+                action = None
+            else:
+                reply, action = self._action_reply(row, decision, files)
+                ids = []
         except LLMError as e:
             raise UserError(str(e)) from e
         ts = now()
         self.db.many("INSERT INTO messages (session_id, role, text, finding_ids, created_at) VALUES (?,?,?,?,?)",
                      [(sid, "user", message, "[]", ts), (sid, "assistant", reply, json.dumps(ids), ts)])
         self.db.run("UPDATE sessions SET updated_at=? WHERE id=?", (ts, sid))
-        return {"reply": reply, "finding_ids": ids}
+        return {"reply": reply, "finding_ids": ids, "action": action}
+
+    def _action_reply(self, row, d, files):
+        """Turn the intent decision into the chat reply and the action for the extension to carry out."""
+        from harness import intent
+        running = self.scans.is_running(row["id"])
+        if d["action"] == "cancel":
+            if not running:
+                return "No scan is running right now.", None
+            return "Stopping the scan.", {"type": "cancel", "full": False, "paths": [], "url": None, "confirm": False}
+        if running:
+            return "A scan is already running. I'll show the results when it finishes, or say \"stop\" to cancel it.", None
+
+        if d["action"] == "scan_github":
+            from harness import github
+            try:
+                owner, repo = github.parse_url(d["url"])
+            except UserError:
+                return ("I can only scan public GitHub repositories given as https://github.com/owner/repo. "
+                        "Which repository should I scan?"), None
+            url = f"https://github.com/{owner}/{repo}"
+            text = f"Do you want me to scan {url}?" if not d["sure"] else f"Scanning {url}."
+            return text, {"type": "scan_github", "full": False, "paths": [], "url": url, "confirm": not d["sure"]}
+
+        # "scan" = this session's target; "scan_workspace" = the local workspace while in a GitHub session.
+        kind = "scan_workspace" if d["action"] == "scan_workspace" and row["target_type"] == "github" else "scan"
+        own_files = files if kind == "scan" else []  # the workspace's files are not known in a GitHub session
+        if own_files:
+            paths, unknown = intent.resolve_paths(d["paths"], own_files)
+        else:  # nothing uploaded yet: pass the folders on; start_scan checks them after the upload
+            paths = [str(p).strip().removeprefix("./").strip("/") for p in d["paths"] if str(p).strip("./ ")]
+            unknown = []
+        if unknown:
+            folders = ", ".join(f"`{f}`" for f in intent.project_folders(files)[:12])
+            return (f"I couldn't find {', '.join(repr(u) for u in unknown)} in this project. "
+                    f"Which folder do you mean? Top folders: {folders}"), None
+        if paths:
+            what = ", ".join(f"`{p}`" for p in paths)
+        elif kind == "scan" and row["target_type"] == "github":
+            what = row["repo_url"]
+        else:
+            what = "the workspace"
+        how = " from scratch" if d["full"] else ""
+        text = f"Do you want me to scan {what}{how}?" if not d["sure"] else f"Starting a scan of {what}{how}."
+        return text, {"type": kind, "full": d["full"], "paths": paths, "url": None, "confirm": not d["sure"]}

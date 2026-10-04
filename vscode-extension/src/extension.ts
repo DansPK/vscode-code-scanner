@@ -30,7 +30,7 @@ export function activate(ctx: vscode.ExtensionContext) {
     })),
     vscode.commands.registerCommand("vulnScanner.scanWorkspace", run(async () => {
       await openChat();
-      await controller.scanWorkspace(false);
+      await controller.scanWorkspace();
     })),
     vscode.commands.registerCommand("vulnScanner.rescan", run(async () => {
       await openChat();
@@ -56,6 +56,7 @@ export function activate(ctx: vscode.ExtensionContext) {
         }
       })(),
     }),
+    vscode.workspace.onDidSaveTextDocument((doc) => controller.onSaved(doc.uri)),
     vscode.workspace.onDidChangeConfiguration((e) => void controller.onSettingsChanged(e).catch((err) => controller.showError(err))),
   );
 

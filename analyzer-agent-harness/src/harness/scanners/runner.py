@@ -10,13 +10,15 @@ from harness.scanners.findings import add_snippets, dedupe_ids
 log = logging.getLogger(__name__)
 
 
-async def run_tools(code_dir, files, session_id, cfg, raw_dir, procs=None, on_done=None, sonar_client=None):
+async def run_tools(code_dir, files, session_id, cfg, raw_dir, procs=None, on_done=None, sonar_client=None,
+                    sonar_inclusions=None):
     """Scan `files` (relative paths) in `code_dir`. SonarQube always scans the whole folder.
     Returns (unmerged findings, errors) where errors maps tool name to a short message.
     A failing tool does not stop the others. `on_done(tool, findings_or_None)` is awaited per tool,
     so callers can show results while the other tools still run."""
     Path(raw_dir).mkdir(parents=True, exist_ok=True)
-    jobs = {"sonarqube": sonarqube.scan(code_dir, session_id, cfg, raw_dir, procs, client=sonar_client)}
+    jobs = {"sonarqube": sonarqube.scan(code_dir, session_id, cfg, raw_dir, procs, client=sonar_client,
+                                        inclusions=sonar_inclusions)}
     if files:  # nothing changed: only SonarQube (which has no partial scan) runs
         jobs = {"semgrep": semgrep.scan(code_dir, files, cfg.semgrep_configs, raw_dir, procs),
                 "gitleaks": gitleaks.scan(code_dir, files, raw_dir, procs), **jobs}

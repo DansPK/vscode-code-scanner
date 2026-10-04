@@ -9,7 +9,7 @@ import { makeFetch } from "./http";
 import { log } from "./log";
 import { route } from "./routing";
 import { fetchAllFindings, prepareWorkspace, TooLargeError, watchToEnd } from "./scanFlow";
-import type { ChatMessage, Finding, SessionInfo } from "./shared/contract";
+import type { ChatAction, ChatMessage, Finding, SessionInfo } from "./shared/contract";
 import type { ConnectionStatus, FindingView, ToExtension, ToWebview } from "./shared/messages";
 import { UploadError } from "./upload";
 import { CancelledError, hashFile } from "./workspaceFiles";
@@ -18,6 +18,22 @@ export const TOKEN_KEY = "vulnScanner.token";
 const LAST_SESSION_KEY = "vulnScanner.lastSession";
 const SESSION_FOLDERS_KEY = "vulnScanner.sessionFolders";
 const LIVE_REFRESH_MS = 1500;
+const SUGGEST_RESCAN_AFTER_MS = 4000;
+
+export interface ScanOptions {
+  full?: boolean;
+  paths?: string[];
+}
+
+/** The keyword rules, used only when the agent cannot be reached. */
+function keywordAction(text: string): ChatAction | null {
+  const r = route(text);
+  const base = { full: false, paths: [], url: null, confirm: false };
+  if (r.kind === "github") return { ...base, type: "scan_github", url: r.url };
+  if (r.kind === "rescan" || r.kind === "scan") return { ...base, type: "scan" };
+  if (/^\s*(stop|cancel|abort)\b/i.test(text)) return { ...base, type: "cancel" };
+  return null;
+}
 
 export interface View {
   post(msg: ToWebview): void;
@@ -46,6 +62,7 @@ export class Controller implements vscode.Disposable {
   }
 
   dispose() {
+    clearTimeout(this.suggestTimer);
     this.diagnostics.dispose();
     this.scanning?.abort.abort();
     void this.client?.close();
@@ -198,9 +215,8 @@ export class Controller implements vscode.Disposable {
           if (this.current) await this.showSession(this.current);
           return;
         case "send": return await this.send(msg.text);
-        case "scan": return await this.scanWorkspace(false);
-        case "rescan": return await this.rescan();
         case "cancel": return await this.cancelScan();
+        case "confirm": return await this.answerConfirm(msg.id, msg.accept);
         case "newSession": return await this.newSession();
         case "switchSession": return await this.switchSession(msg.id);
         case "renameSession": return await this.renameSession(msg.id, msg.name);
@@ -230,23 +246,90 @@ export class Controller implements vscode.Disposable {
     this.post({ type: "error", message: err?.message || String(e) });
   }
 
-  /** Chat routing: a GitHub link, a rescan, a project scan, or a question for the agent. */
+  /** Every message goes to the agent, which answers and may ask us to start or stop a scan.
+   * If the agent is unavailable, simple keyword rules still recognise scan commands. */
   async send(text: string) {
     text = text.trim();
     if (!text) return;
     this.say(text, "user");
-    const r = route(text);
-    if (r.kind === "github") return this.scanGithub(r.url);
-    if (r.kind === "rescan") return this.rescan();
-    if (r.kind === "scan") return this.scanWorkspace(false);
     const client = await this.ready();
     if (!this.current) await this.useSession(await this.createSession("workspace"));
     this.post({ type: "thinking", on: true });
+    let reply;
     try {
-      const reply = await client.chat(this.current!, text);
-      this.post({ type: "message", message: { role: "assistant", text: reply.reply, finding_ids: reply.finding_ids } });
+      reply = await client.chat(this.current!, text);
+    } catch (e) {
+      const err = e as Error;
+      const fallback = e instanceof ToolCallError && /\bLLM\b/.test(err.message) ? keywordAction(text) : null;
+      if (!fallback) throw e;
+      this.post({ type: "thinking", on: false });
+      log.warn(`Agent unavailable (${err.message}); using keyword rules`);
+      this.say(`The assistant is unavailable right now (${err.message}), but this looks like a scan request.`);
+      return this.runAction(fallback);
     } finally {
       this.post({ type: "thinking", on: false });
+    }
+    this.post({ type: "message", message: { role: "assistant", text: reply.reply, finding_ids: reply.finding_ids } });
+    if (reply.action) await this.offerAction(reply.action);
+  }
+
+  private pending = new Map<string, () => Promise<void>>();
+  private editedWithFindings = new Set<string>();
+  private alreadySuggested = new Set<string>();
+  private suggestTimer?: NodeJS.Timeout;
+
+  /** After you save files that have findings, offer a rescan (once per file until the next scan). */
+  onSaved(uri: vscode.Uri) {
+    const s = this.currentSession();
+    if (!s || s.target_type !== "workspace" || uri.scheme !== "file") return;
+    const folder = this.sessionFolder(s.session_id);
+    if (!folder) return;
+    const rel = path.relative(folder, uri.fsPath).split(path.sep).join("/");
+    if (rel.startsWith("..") || this.alreadySuggested.has(rel) || !this.findings.some((f) => f.path === rel)) return;
+    this.editedWithFindings.add(rel);
+    clearTimeout(this.suggestTimer);
+    this.suggestTimer = setTimeout(() => this.suggestRescan(), SUGGEST_RESCAN_AFTER_MS);
+  }
+
+  private suggestRescan() {
+    if (this.scanning || this.busy || !this.editedWithFindings.size) return;
+    const files = [...this.editedWithFindings];
+    this.editedWithFindings.clear();
+    files.forEach((f) => this.alreadySuggested.add(f));
+    const list = files.slice(0, 3).map((f) => `\`${f}\``).join(", ") + (files.length > 3 ? ` and ${files.length - 3} more` : "");
+    this.say(`You changed ${files.length === 1 ? "a file" : `${files.length} files`} with findings (${list}). `
+      + "Want me to rescan to see if they are fixed?");
+    this.ask("Rescan", () => this.rescan());
+  }
+
+  /** Run an action, or ask first with Yes/No buttons when the agent was not sure. */
+  private async offerAction(action: ChatAction) {
+    if (!action.confirm) return this.runAction(action);
+    this.ask(action.type === "cancel" ? "Stop the scan" : "Yes, scan", () => this.runAction(action));
+  }
+
+  private ask(yes: string, onYes: () => Promise<void>, no = "No") {
+    const id = Math.random().toString(36).slice(2);
+    this.pending.set(id, onYes);
+    this.post({ type: "confirm", id, yes, no });
+  }
+
+  private async answerConfirm(id: string, accept: boolean) {
+    const run = this.pending.get(id);
+    this.pending.delete(id);
+    this.post({ type: "confirmDone", id });
+    if (!run) return;
+    if (accept) await run();
+    else this.say("OK, I won't.");
+  }
+
+  private async runAction(a: ChatAction) {
+    const opts = { full: a.full, paths: a.paths };
+    switch (a.type) {
+      case "cancel": return this.cancelScan();
+      case "scan_github": return this.scanGithub(a.url!, opts);
+      case "scan_workspace": return this.scanWorkspace(opts);
+      case "scan": return this.rescan(opts);
     }
   }
 
@@ -347,14 +430,16 @@ export class Controller implements vscode.Disposable {
     if (this.scanning) throw new ToolCallError("A scan is already running. Wait for it, or click Cancel.");
   }
 
-  async rescan() {
+  /** Scan the current session's target again: the GitHub repo, or the workspace. */
+  async rescan(opts: ScanOptions = {}) {
     const s = this.currentSession();
-    if (s?.target_type === "github" && s.repo_url) return this.scanGithub(s.repo_url);
-    return this.scanWorkspace(true);
+    if (s?.target_type === "github" && s.repo_url) return this.scanGithub(s.repo_url, opts);
+    return this.scanWorkspace(opts);
   }
 
-  /** Workspace scan or rescan: same flow; a rescan with no changes stops early. */
-  async scanWorkspace(isRescan: boolean) {
+  /** Workspace scan: upload what changed, then scan. With nothing changed and no full or folder
+   * scan asked for, it stops early. */
+  async scanWorkspace(opts: ScanOptions = {}) {
     this.ensureNotScanning();
     const client = await this.ready();
     const folder = await this.pickFolder();
@@ -392,9 +477,15 @@ export class Controller implements vscode.Disposable {
           signal: abort.signal,
         });
       });
+      const extra = { full: opts.full || undefined, paths: opts.paths?.length ? opts.paths : undefined };
       if (prepared.nothingChanged) {
         if (prepared.fileCount === 0) {
           this.say("There are no files to scan in this folder.");
+          return;
+        }
+        if (extra.full || extra.paths) {
+          const { scan_id } = await client.startScan(sessionId, extra);
+          await this.follow(client, sessionId, scan_id);
           return;
         }
         // Skip only when the last scan finished; after a failed or cancelled one, scan again.
@@ -413,7 +504,7 @@ export class Controller implements vscode.Disposable {
           + `${prepared.deleted.length ? ` (${prepared.deleted.length} deleted)` : ""}. Starting the scan.`
         : `${prepared.deleted.length} files were deleted. Starting the scan.`);
       const { scan_id } = await client.startScan(sessionId, { upload_id: prepared.uploadId,
-                                                               deleted_paths: prepared.deleted });
+                                                               deleted_paths: prepared.deleted, ...extra });
       await this.follow(client, sessionId, scan_id);
     } finally {
       this.busy = false;
@@ -421,7 +512,7 @@ export class Controller implements vscode.Disposable {
     }
   }
 
-  async scanGithub(url: string) {
+  async scanGithub(url: string, opts: ScanOptions = {}) {
     this.ensureNotScanning();
     const client = await this.ready();
     let s = this.currentSession();
@@ -430,8 +521,8 @@ export class Controller implements vscode.Disposable {
       await this.useSession(await this.createSession("github", url));
       s = this.currentSession();
     }
-    this.say(`Scanning ${url}...`);
-    const { scan_id } = await client.startScan(s!.session_id);
+    const { scan_id } = await client.startScan(s!.session_id, {
+      full: opts.full || undefined, paths: opts.paths?.length ? opts.paths : undefined });
     await this.follow(client, s!.session_id, scan_id);
   }
 
@@ -459,6 +550,8 @@ export class Controller implements vscode.Disposable {
       }
     } finally {
       this.scanning = null;
+      this.alreadySuggested.clear();
+      this.editedWithFindings.clear();
       await this.refreshSessions().catch(() => undefined);
       this.postState();
     }

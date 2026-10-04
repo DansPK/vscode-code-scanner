@@ -70,7 +70,8 @@ class ScanManager:
                            "ORDER BY created_at DESC, rowid DESC LIMIT 1", (session_id,))
 
     def start(self, session, plan):
-        """`plan`: {"files": all manifest paths, "changed": set, "full": bool, "web_base": str|None}."""
+        """`plan`: {"files": all manifest paths, "changed": set, "full": bool, "web_base": str|None,
+        "paths": list of path prefixes to limit the scan to ([] = everything)}."""
         scan_id = secrets.token_hex(12)
         self.db.run("INSERT INTO scans (id, session_id, status, stage, percent, created_at) "
                     "VALUES (?,?,'queued','preparing',0,?)", (scan_id, session["id"], now()))
@@ -100,15 +101,19 @@ class ScanManager:
             await self._update(run, "Preparing the scan", status="running", stage="preparing", percent=2,
                                started_at=now())
             prev = self.latest_done(sid)
-            incremental = prev is not None and not plan["full"]
-            targets = sorted(plan["changed"]) if incremental else sorted(plan["files"])
+            scope = plan.get("paths") or []
+            in_scope = _scope_test(scope)
+            # Files to run Semgrep and Gitleaks on: in scope, and changed unless this is a full scan.
+            targets = sorted(p for p in plan["files"]
+                             if in_scope(p) and (plan["full"] or prev is None or p in plan["changed"]))
             remaining = [t for t in TOOLS if targets or t == "sonarqube"]
             started = len(remaining)
-            await self._update(run, f"Scanning {len(targets)} files", stage=remaining[0], percent=5)
+            where = f" in {', '.join(scope)}" if scope else ""
+            await self._update(run, f"Scanning {len(targets)} files{where}", stage=remaining[0], percent=5)
 
             before = {r["id"] for r in self.db.all("SELECT id FROM findings WHERE scan_id=?", (prev["id"],))} \
                 if prev else set()
-            carried = self._carry_over(prev, plan, {}) if incremental else []
+            carried = self._carry_over(prev, plan, {}, in_scope) if prev else []
             partial = list(carried)
 
             def publish(raw_list):
@@ -135,20 +140,21 @@ class ScanManager:
                     text = f"{TOOL_NAMES[tool]}: {len(result)} findings ({len(shown)} so far)"
                 await self._update(run, text, stage=remaining[0] if remaining else "merging", percent=pct)
 
-            unchanged = incremental and not targets
+            unchanged = prev is not None and not plan["full"] and not targets
             if unchanged:
                 # Nothing changed: keep every earlier finding instead of rescanning.
                 await self._update(run, "No files changed since the last scan; keeping its findings",
                                    stage="merging", percent=60)
-                raw, errors = self._carry_over(prev, plan, {"sonarqube": "not run"}), {}
+                raw, errors = self._carry_over(prev, plan, {"sonarqube": "not run"}, in_scope), {}
             else:
                 if carried:
                     await asyncio.to_thread(publish, carried)
                 raw, errors = await runner.run_tools(code_dir, targets, sid, self.cfg, raw_dir, run.procs,
-                                                     on_done, self.sonar_client)
+                                                     on_done, self.sonar_client,
+                                                     sonar_inclusions=_sonar_inclusions(scope, plan["files"]))
                 await self._update(run, "Merging results", stage="merging", percent=60)
-                if incremental:
-                    raw += self._carry_over(prev, plan, errors)
+                if prev:
+                    raw += self._carry_over(prev, plan, errors, in_scope)
             raw_dir.mkdir(parents=True, exist_ok=True)
             Path(raw_dir, "tool_findings.json").write_text(json.dumps(raw))
             findings = runner.finalize(raw, code_dir)
@@ -195,17 +201,25 @@ class ScanManager:
                 run.version += 1
                 run.changed.notify_all()
 
-    def _carry_over(self, prev, plan, errors):
-        """Earlier per-tool findings for unchanged files. This run only scanned changed files
-        with Semgrep and Gitleaks, so theirs are kept. SonarQube rescanned everything, so its
-        earlier findings are kept only if it failed this time."""
+    def _carry_over(self, prev, plan, errors, in_scope):
+        """Earlier per-tool findings to keep:
+        - everything for files outside the scan's scope (a folder scan leaves the rest alone);
+        - in scope, unless this is a full scan: Semgrep and Gitleaks results for unchanged files
+          (only changed files were rescanned), and SonarQube's only if it failed this time."""
         path = self.scan_dir(prev["session_id"], prev["id"]) / "raw" / "tool_findings.json"
         if not path.exists():
             return []
         present = set(plan["files"])
-        return [f for f in json.loads(path.read_text())
-                if f["path"] in present and f["path"] not in plan["changed"]
-                and (f["tools"][0] != "sonarqube" or "sonarqube" in errors)]
+        keep = []
+        for f in json.loads(path.read_text()):
+            if f["path"] not in present:
+                continue
+            if not in_scope(f["path"]):
+                keep.append(f)
+            elif not plan["full"] and f["path"] not in plan["changed"] and (
+                    f["tools"][0] != "sonarqube" or "sonarqube" in errors):
+                keep.append(f)
+        return keep
 
     def status(self, scan_id):
         row = self.db.one("SELECT * FROM scans WHERE id=?", (scan_id,))
@@ -244,6 +258,21 @@ class ScanManager:
         for run in list(self.running.values()):
             if run.session_id == session_id:
                 await self.cancel(run.scan_id)
+
+
+def _scope_test(scope):
+    """A test for "is this path inside the scan's scope". Scope entries are files or folders."""
+    if not scope:
+        return lambda p: True
+    return lambda p: any(p == s or p.startswith(s + "/") for s in scope)
+
+
+def _sonar_inclusions(scope, files):
+    """sonar.inclusions patterns for a scoped scan, or None for everything."""
+    if not scope:
+        return None
+    present = set(files)
+    return [s if s in present else f"{s}/**" for s in scope]
 
 
 def _short_error(e):

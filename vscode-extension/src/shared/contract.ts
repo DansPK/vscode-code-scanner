@@ -87,7 +87,21 @@ export interface FindingsPage {
   total: number;
 }
 
+/** What the agent decided the user wants; the extension carries it out (only it can upload files). */
+export interface ChatAction {
+  /** scan: the current session's target; scan_workspace: the local workspace (from a GitHub session);
+   * scan_github: the repo in `url`; cancel: stop the running scan. */
+  type: "scan" | "scan_workspace" | "scan_github" | "cancel";
+  full: boolean;
+  /** Folders or files to limit the scan to; empty for everything. */
+  paths: string[];
+  url: string | null;
+  /** Ask the user first: the agent only thinks this is wanted. */
+  confirm: boolean;
+}
+
 export interface ChatReply {
   reply: string;
   finding_ids: string[];
+  action?: ChatAction | null;
 }

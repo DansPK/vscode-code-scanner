@@ -12,16 +12,19 @@ Scan your code for vulnerabilities from a chat panel in the sidebar. The scannin
 
 ## Using it
 
-Type in the chat:
+There are no scan buttons: you tell the assistant what you want, in your own words. Every message goes to the agent on the harness, which answers questions and starts or stops scans:
 
-| You type | What happens |
+| You type, for example | What happens |
 | --- | --- |
-| `scan this project` (or "analyze the code", "check this folder") | Scans the open workspace folder |
-| `rescan` / `scan again` | Sends only the files that changed since the last scan, then rescans |
-| a GitHub link, e.g. `https://github.com/owner/repo` | Scans that repo on the server (a new GitHub session) |
-| anything else | Asks the agent about your code and findings |
+| "scan this project", "check my changes", "rescan" | Sends only the files that changed since the last scan, then scans |
+| "scan everything again from scratch" | A full scan |
+| "scan only the backend api", "just check src/auth" | Scans only that folder; findings for the rest are kept |
+| a GitHub link, e.g. "scan https://github.com/owner/repo" | Scans that repo on the server (a GitHub session) |
+| "stop" / "cancel the scan" | Stops the running scan (the **Stop** button next to the progress bar does the same) |
+| "is my login code safe?" | When the agent only *thinks* a scan would help, it asks first: **Yes, scan** / **No** |
+| anything else | The agent answers, using the findings and your code |
 
-The **Scan**, **Rescan** and **Cancel** buttons do the same. Enter sends; Shift+Enter adds a new line.
+After you save a file that has findings, the assistant offers a rescan. If the LLM cannot be reached, simple scan commands ("scan", "rescan", a GitHub link, "stop") still work. Enter sends; Shift+Enter adds a new line.
 
 **Findings** appear while the scan runs, as each scanner finishes; ones the LLM has not reviewed yet say *Reviewing…*. They are grouped by severity, then by file. Expand one to read the explanation, how to fix it, and a suggested patch (with a copy button). **Open** jumps to the lines in the editor, or opens GitHub for a GitHub session. If the file changed since the scan, you get a note to rescan. Workspace findings also show as squiggles and in the Problems panel.
 
@@ -50,7 +53,7 @@ On a rescan, only new and changed files are sent. Before uploading, the extensio
 
 ## Commands
 
-*Vuln Scanner:* Set Token, Clear Token, Open Chat, New Session, Scan Workspace, Rescan, Cancel Scan.
+*Vuln Scanner:* Set Token, Clear Token, Open Chat, New Session, Scan Workspace, Rescan, Cancel Scan. (Scan, Rescan and Cancel are also available here for keyboard users.)
 
 Logs are in the **Vuln Scanner** output channel. They never contain your token or file contents.
 

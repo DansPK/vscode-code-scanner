@@ -107,7 +107,7 @@ async def test_session_crud_and_chat(harness_server, tokens):
         sid = (await call(c, "create_session", {"name": "one"}))["session_id"]
         await call(c, "rename_session", {"session_id": sid, "name": "two"})
         r = await call(c, "chat", {"session_id": sid, "message": "hi there"})
-        assert r == {"reply": "Hello! No scan yet.", "finding_ids": []}
+        assert r == {"reply": "Hello! No scan yet.", "finding_ids": [], "action": None}
         info = await call(c, "get_session", {"session_id": sid})
         assert info["session"]["name"] == "two"
         assert [(m["role"], m["text"]) for m in info["messages"]] == [("user", "hi there"),

@@ -11,3 +11,4 @@
 6. **The scan summary in the chat** is shown locally and is not saved in the harness history (only `chat` calls are saved there).
 7. **"Largest folders"** for an archive that is too large are grouped by the first two folder levels.
 8. **Screenshots for the README** are not included yet; they need a real run against the harness.
+9. **No Scan/Rescan buttons (changed later at the user's request).** The agent on the harness decides what each message wants, and returns an `action` in the `chat` reply (added to the shared contract). The extension still keeps the keyword rules from Milestone 3, used only when the LLM cannot be reached. Scan, Rescan and Cancel stay as commands; a Stop button shows while a scan runs.

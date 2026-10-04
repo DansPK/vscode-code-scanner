@@ -106,9 +106,10 @@ def build_app(cfg, service=None):
 
     @tool
     async def start_scan(ctx: Context, session_id: str, upload_id: str | None = None,
-                         deleted_paths: list[str] | None = None, full: bool = False) -> dict:
-        """Start a scan. Returns at once with the scan id."""
-        return await service.start_scan(user_id(ctx), session_id, upload_id, deleted_paths, full)
+                         deleted_paths: list[str] | None = None, full: bool = False,
+                         paths: list[str] | None = None) -> dict:
+        """Start a scan. Returns at once with the scan id. `paths` limits it to some folders or files."""
+        return await service.start_scan(user_id(ctx), session_id, upload_id, deleted_paths, full, paths)
 
     @tool
     async def watch_scan(ctx: Context, scan_id: str) -> dict:

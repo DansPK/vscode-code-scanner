@@ -109,7 +109,8 @@ def _path(component, key):
     return component.split(":", 1)[1] if component.startswith(key + ":") else None
 
 
-async def scan(code_dir, session_id, cfg, raw_dir, procs=None, client=None):
+async def scan(code_dir, session_id, cfg, raw_dir, procs=None, client=None, inclusions=None):
+    """Analyse the folder (or only `inclusions`, a list of sonar.inclusions patterns) and return findings."""
     client = client or SonarClient(cfg.sonar_host_url, cfg.sonar_token)
     key = project_key(session_id)
     status = (await client.get("/api/system/status")).get("status")
@@ -129,6 +130,7 @@ async def scan(code_dir, session_id, cfg, raw_dir, procs=None, client=None):
             # Java projects without compiled classes: point at an empty folder so the scan does not fail.
             f"-Dsonar.java.binaries={empty}",
             "-Dsonar.qualitygate.wait=false",
+            *([f"-Dsonar.inclusions={','.join(inclusions)}"] if inclusions else []),
         ], cwd=code_dir, procs=procs, env={**os.environ, "SONAR_TOKEN": cfg.sonar_token})
         if rc != 0:
             tail = "\n".join(l for l in (out + err).splitlines() if "ERROR" in l)[-400:]

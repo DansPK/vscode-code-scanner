@@ -19,3 +19,5 @@
 12. **Symlinks in GitHub repos are deleted after clone and fetch**, so no scanner can follow one out of the repo.
 13. **Chat cannot start scans for any session type.** For GitHub sessions, the agent tells the user to send the link again or click Rescan.
 14. **Tokens file is JSON**, so no YAML dependency is needed.
+15. **Chat-driven scans (added later at the user's request).** `chat` first makes one routing LLM call that returns JSON (not a tool call, which small local models handle badly), then answers or returns an `action`. `start_scan` takes `paths` to scan only some folders; findings elsewhere are kept from the previous scan. Both are in the shared contract now.
+16. **Merging also joins one tool's duplicates**, when they are on the same start line with the same CWE (several Semgrep rules often report one problem). This replaces choice 5.

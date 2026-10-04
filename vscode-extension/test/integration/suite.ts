@@ -101,6 +101,62 @@ test("editing a file marks its findings out of date; rescan uploads only that fi
   assert.ok(texts().includes("No files changed since the last scan."));
 });
 
+test("the agent asks first when unsure; Yes runs the scan, No does not", async () => {
+  posted = [];
+  await controller.send("is my code safe?");
+  const ask = last("confirm")!;
+  assert.ok(ask, "Yes/No buttons were shown");
+  assert.ok(texts().includes("Do you want me to scan the workspace?"));
+  const scansBefore = fake.calls.filter((c) => c.name === "start_scan").length;
+  await controller.handle({ type: "confirm", id: ask.id, accept: false });
+  assert.ok(texts().includes("OK, I won't."));
+  assert.equal(fake.calls.filter((c) => c.name === "start_scan").length, scansBefore);
+
+  posted = [];
+  await controller.send("is my code safe?");
+  await controller.handle({ type: "confirm", id: last("confirm")!.id, accept: true });
+  // Nothing changed since the last scan, so the extension says so instead of scanning.
+  assert.ok(texts().includes("No files changed since the last scan."));
+});
+
+test("full and folder scans are passed on to the harness", async () => {
+  posted = [];
+  await controller.send("scan everything again from scratch");
+  let call = fake.calls.filter((c) => c.name === "start_scan").pop()!;
+  assert.equal(call.args.full, true);
+  await controller.send("scan only the lib folder");
+  call = fake.calls.filter((c) => c.name === "start_scan").pop()!;
+  assert.deepEqual(call.args.paths, ["lib"]);
+});
+
+test("when the LLM is down, scan commands still work by keyword", async () => {
+  fake.llmDown = true;
+  try {
+    posted = [];
+    const before = fake.calls.filter((c) => c.name === "sync_files").length;
+    await controller.send("rescan");
+    assert.ok(texts().some((t) => t.startsWith("The assistant is unavailable right now")));
+    assert.ok(fake.calls.filter((c) => c.name === "sync_files").length > before, "the workspace was synced");
+    posted = [];
+    await assert.rejects(controller.send("what is XSS?"), /LLM cannot be reached/);
+  } finally {
+    fake.llmDown = false;
+  }
+});
+
+test("saving a file with findings offers a rescan", async () => {
+  posted = [];
+  const uri = vscode.Uri.file(path.join(root(), "app.js"));
+  controller.onSaved(uri);
+  await new Promise((r) => setTimeout(r, 4600));
+  assert.ok(texts().some((t) => t.startsWith("You changed a file with findings (`app.js`)")));
+  assert.equal(last("confirm")!.yes, "Rescan");
+  posted = [];
+  controller.onSaved(uri); // already offered for this file: no second offer until the next scan
+  await new Promise((r) => setTimeout(r, 4600));
+  assert.ok(!texts().some((t) => t.startsWith("You changed")));
+});
+
 test("chat goes to the chat tool and comes back as Markdown text", async () => {
   posted = [];
   await controller.send("what is the worst finding?");

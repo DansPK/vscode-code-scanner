@@ -140,12 +140,12 @@ All tools return JSON objects. On error, the tool returns an MCP error result wi
 | `delete_session` | `session_id` | `ok` |
 | `sync_files` | `session_id`, `manifest` | `need` (list of paths), `delete` (list of paths), `unchanged_count` |
 | `request_upload` | `session_id`, `size_bytes`, `sha256` | `upload_id`, `upload_url`, `expires_at` |
-| `start_scan` | `session_id`, `upload_id` (optional), `deleted_paths` (optional), `full` (optional boolean, default false) | `scan_id` |
+| `start_scan` | `session_id`, `upload_id` (optional), `deleted_paths` (optional), `full` (optional boolean, default false), `paths` (optional list of folders or files to limit the scan to; findings for other files are kept from the previous scan) | `scan_id` |
 | `watch_scan` | `scan_id` | Sends progress notifications while the scan runs. Returns the final scan summary when it ends. |
 | `get_scan_status` | `scan_id` | scan summary (see below) |
 | `cancel_scan` | `scan_id` | `ok` |
 | `get_findings` | `session_id`, `scan_id` (optional, default latest), `severity` (optional list), `tool` (optional list), `path` (optional), `limit` (default 200), `offset` (default 0) | `findings`, `total` |
-| `chat` | `session_id`, `message` | `reply` (Markdown text), `finding_ids` (findings the reply talks about) |
+| `chat` | `session_id`, `message` | `reply` (Markdown text), `finding_ids` (findings the reply talks about), `action` (a chat action, or null) |
 
 Rules:
 
@@ -153,6 +153,19 @@ Rules:
 - For a `github` session, `sync_files` and `request_upload` are not used. `start_scan` clones the repo the first time and pulls after that.
 - Only one scan runs per session at a time. A second `start_scan` while one is running returns an error.
 - Each `chat` call is saved to the session's history, both the user message and the reply.
+- `get_findings` with the `scan_id` of a running scan returns the findings found so far. A finding whose `explanation` is empty has not been reviewed by the LLM yet.
+
+### Chat action
+
+The agent decides what each chat message asks for. When it wants a scan started or stopped, the `chat` reply carries an action. The extension carries it out, because only the extension can upload workspace files.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `type` | string | `scan` (the session's own target: the workspace, or the GitHub repo), `scan_workspace` (the local workspace, asked from a GitHub session), `scan_github` (the repo in `url`), or `cancel` (stop the running scan) |
+| `full` | boolean | Scan everything again, not only changed files |
+| `paths` | list of strings | Folders or files to limit the scan to; empty means everything |
+| `url` | string or null | For `scan_github`: `https://github.com/<owner>/<repo>` |
+| `confirm` | boolean | The agent is not sure: ask the user (Yes/No) before acting |
 
 ### Scan summary
 

@@ -120,7 +120,8 @@ export class HarnessClient {
   requestUpload(session_id: string, size_bytes: number, sha256: string) {
     return this.call<UploadTicket>("request_upload", { session_id, size_bytes, sha256 });
   }
-  startScan(session_id: string, opts: { upload_id?: string; deleted_paths?: string[]; full?: boolean } = {}) {
+  startScan(session_id: string,
+            opts: { upload_id?: string; deleted_paths?: string[]; full?: boolean; paths?: string[] } = {}) {
     return this.call<{ scan_id: string }>("start_scan", { session_id, ...opts });
   }
   watchScan(scan_id: string, onProgress: (percent: number, message: string) => void, signal?: AbortSignal) {
