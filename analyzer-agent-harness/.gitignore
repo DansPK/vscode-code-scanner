@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 data/
 certs/
+docker-compose.override.yml

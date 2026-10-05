@@ -19,6 +19,8 @@ The scanning runs in Docker — Semgrep, Gitleaks and SonarQube Community Editio
 
 ## Quick start
 
+For the full walkthrough, including port conflicts, checking the LLM, packaging the extension and troubleshooting, see [SETUP.md](SETUP.md).
+
 1. In `analyzer-agent-harness/`, copy `.env.example` to `.env`, fill it in, and run `docker compose up -d --build`. See the harness README for the SonarQube token and (optional) HTTPS setup.
 2. Create a user token: `docker compose exec harness harness-token <your-name>`.
 3. Install the extension, set `vulnScanner.serverUrl`, and paste the token with **Vuln Scanner: Set Token**.
