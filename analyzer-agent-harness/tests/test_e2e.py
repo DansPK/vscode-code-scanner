@@ -206,7 +206,8 @@ async def test_findings_appear_while_the_scan_runs(harness_server, tokens, vuln_
         s = await call(c, "sync_files", {"session_id": sid, "manifest": manifest(vuln_app)})
         up, _ = await upload(c, sid, archive(vuln_app, s["need"]))
         scan_id = (await call(c, "start_scan", {"session_id": sid, "upload_id": up["upload_id"]}))["scan_id"]
-        for _ in range(200):
+        deadline = asyncio.get_running_loop().time() + 120  # Semgrep is slow on a busy machine
+        while asyncio.get_running_loop().time() < deadline:
             st = await call(c, "get_scan_status", {"scan_id": scan_id})
             live = await call(c, "get_findings", {"session_id": sid, "scan_id": scan_id})
             if st["stage"] == "llm_review" and any(f["explanation"] for f in live["findings"]):

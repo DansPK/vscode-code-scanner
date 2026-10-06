@@ -64,6 +64,8 @@ All settings are environment variables. See the table in `IMPLEMENT_HARNESS.md` 
 - **One scan per session at a time.** Scans run inside the harness process; a restart marks running scans as failed.
 - **GitHub:** public repos, or private ones reachable with the server's own git credentials. Shallow clones only. The work tree is limited to `UPLOAD_MAX_UNPACKED_MB`.
 - **The chat agent decides what each message wants** (`intent.py`): one short LLM call with a JSON answer picks scan / GitHub scan / cancel / just answer, with full and folder options. The `chat` result's `action` tells the extension what to do; unsure guesses come with `confirm: true`. Folder names the user never mentioned are dropped (small models invent them), and loose names are matched to real folders ("api" → `Kasephal-API`). Tested against `deephat-v1-7b`: 13 of 14 sample messages routed right, about 1 s each.
+- **Fix agent** (`fix_findings`) is a tool-calling agent per file: it reads and searches the code, edits any file, reruns Semgrep (only the relevant rules, a few seconds) and Gitleaks on its changes, and reports `fixed` / `still_reported` / `not_verified` / `not_fixed` per finding. SonarQube findings cannot be rechecked on one file, so they come back `not_verified` until the next scan. It only proposes line edits; the extension applies them after the user accepts. It needs a model with tool calling (`LLM_TOOL_CALLING=true`); otherwise, or if the server rejects tool calls, it falls back to one-shot edits around each finding. Tested with `deepseek-v4.1-flash`: the fixture's 9 findings in 4 files fixed and confirmed in about 66 s. Workspace sessions only.
+- **Summary** ("summarize all findings") is counts computed by the harness plus a short LLM assessment. Sections the model adds beyond Overall / Top risks / Fix first are dropped. If the LLM fails, the counts are still returned.
 - **Live findings.** While a scan runs, `get_findings` with that `scan_id` returns findings as soon as each scanner finishes, and each finding's LLM fields fill in as its review completes (an empty `explanation` means "not reviewed yet"). Without `scan_id`, `get_findings` still returns the latest *finished* scan.
 - **Limits:** chat messages up to 8,000 characters; manifests up to 200,000 files; MCP requests up to 64 MB.
 
@@ -73,7 +75,7 @@ All settings are environment variables. See the table in `IMPLEMENT_HARNESS.md` 
 | --- | --- |
 | A scanner binary is missing | Scan finishes as `done`; `error` says e.g. `gitleaks: gitleaks is not installed` |
 | SonarQube is down | `error` says `sonarqube: SonarQube cannot be reached at ...`; the other tools' findings are kept |
-| LLM is down | `error` says `llm: The LLM cannot be reached at ...`; findings have verdict `unsure`. Chat returns the same message. |
+| LLM is down | `error` says `llm: The LLM cannot be reached. Check LLM_BASE_URL on the scanner server.` (the URL itself is never shown); findings have verdict `unsure`. Chat returns the same message. |
 | Disk full | Upload returns HTTP 507; a scan fails with `The server disk is full.` |
 
 Logs go to stderr, one line per record, tagged with `session=` and `scan=`. Tokens, upload signatures, API keys and secret values are never logged.

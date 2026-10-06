@@ -140,6 +140,19 @@ def build_app(cfg, service=None):
         """Ask the agent about the code and the findings."""
         return await service.chat(user_id(ctx), session_id, message)
 
+    @tool
+    async def summarize_findings(ctx: Context, session_id: str) -> dict:
+        """A short summary of the latest scan's findings (not saved in the chat history)."""
+        return await service.summarize_findings(user_id(ctx), session_id)
+
+    @tool
+    async def fix_findings(ctx: Context, session_id: str, finding_ids: list[str]) -> dict:
+        """Let the fix agent fix findings. Sends progress notifications. Returns line edits per file;
+        nothing is changed, the extension applies them."""
+        async def report(percent, message):
+            await ctx.report_progress(percent, 100, message)
+        return await service.fix_findings(user_id(ctx), session_id, finding_ids, report)
+
     # Large manifests (up to 200,000 files) do not fit the SDK's 4 MB default.
     inner = mcp.streamable_http_app(host=cfg.host, max_request_body_size=MAX_REQUEST_BYTES)
 

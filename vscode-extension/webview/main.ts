@@ -1,7 +1,7 @@
 // The chat panel UI. It talks only to the extension, through postMessage.
 
 import MarkdownIt from "markdown-it";
-import type { ChatMessage, SessionInfo } from "../src/shared/contract";
+import type { AgentEvent, ChatMessage, SessionInfo } from "../src/shared/contract";
 import type { ConnectionStatus, FindingView, ToExtension, ToWebview } from "../src/shared/messages";
 
 interface UiState {
@@ -70,6 +70,8 @@ progress.append(el("div", { class: "progress-row" }, progressText, stopBtn), el(
 const chatTab = el("button", { class: "tab", role: "tab", text: "Chat" });
 const findingsTab = el("button", { class: "tab", role: "tab" });
 const tabs = el("div", { class: "tabs", role: "tablist" }, chatTab, findingsTab);
+const rescanBtn = el("button", { class: "secondary small rescan", text: "Rescan" });
+const tabBar = el("div", { class: "tab-bar" }, tabs, rescanBtn);
 
 // chat panel
 const messages = el("div", { class: "messages", role: "log", "aria-live": "polite" });
@@ -88,8 +90,14 @@ const search = el("input", { type: "search", class: "search", placeholder: "Filt
 const findingsNote = el("div", { class: "note" });
 const findingsList = el("div", { class: "findings" });
 const findingsEmpty = el("div", { class: "empty" });
+const summarizeBtn = el("button", { class: "secondary small", title: "Ask the assistant for a summary of all findings",
+                                    text: "Summarize" });
+const fixAllBtn = el("button", { class: "secondary small",
+                                title: "Fix every finding that is not a likely false alarm. You review the changes before they are applied.",
+                                text: "Fix all" });
 const findingsPanel = el("div", { class: "panel findings-panel" },
-  el("div", { class: "filters" }, chips, search), findingsNote, findingsList, findingsEmpty);
+  el("div", { class: "filters" }, el("div", { class: "filter-row" }, chips, summarizeBtn, fixAllBtn), search),
+  findingsNote, findingsList, findingsEmpty);
 
 // Shown while the chat is empty: what you can say. Clicking one sends it (or starts it in the box).
 const EXAMPLES: [string, boolean][] = [
@@ -97,6 +105,8 @@ const EXAMPLES: [string, boolean][] = [
   ["Scan only the ", false],
   ["Scan https://github.com/", false],
   ["What are the most serious problems?", true],
+  ["Summarize all findings", true],
+  ["Fix all high findings", true],
   ["Scan everything again from scratch", true],
 ];
 const welcome = el("div", { class: "welcome" },
@@ -117,13 +127,14 @@ for (const [text, complete] of EXAMPLES) {
 welcome.append(exampleList);
 messages.before(welcome);
 
-document.getElementById("app")!.append(status, sessionBar, progress, tabs, chatPanel, findingsPanel);
+document.getElementById("app")!.append(status, sessionBar, progress, tabBar, chatPanel, findingsPanel);
 
 // --- state ---
 
 let sessions: SessionInfo[] = [];
 let current: string | null = null;
 let scanning = false;
+let changedFiles = 0;
 let connected = false;
 let findings: FindingView[] = [];
 let hiddenFalsePositives = 0;
@@ -164,6 +175,15 @@ function updateControls() {
   renameBtn.disabled = !connected || !current;
   deleteBtn.disabled = !connected || !current;
   sessionSelect.disabled = !connected || scanning;
+  summarizeBtn.disabled = !connected || !findings.length;
+  rescanBtn.disabled = !connected || scanning || !current;
+  rescanBtn.classList.toggle("attention", changedFiles > 0);
+  rescanBtn.textContent = changedFiles ? `Rescan · ${changedFiles} changed` : "Rescan";
+  rescanBtn.title = changedFiles
+    ? `${changedFiles} saved file${changedFiles === 1 ? " has" : "s have"} findings. Rescan to see if they are fixed.`
+    : "Scan the files that changed since the last scan";
+  fixAllBtn.disabled = !connected || scanning || !findings.length;
+  fixAllBtn.classList.toggle("hidden", !isWorkspace());
 }
 
 function renderSessions() {
@@ -227,6 +247,71 @@ function renderConfirm(id: string, yes: string, no: string) {
   messages.scrollTop = messages.scrollHeight;
 }
 
+// --- fix agent transcript ---
+
+interface AgentBlock { root: HTMLDetailsElement; title: HTMLElement; body: HTMLElement; files: Map<string, HTMLElement> }
+const agentBlocks = new Map<string, AgentBlock>();
+
+function nearBottom() {
+  return messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
+}
+
+function agentStart(id: string, title: string) {
+  const titleEl = el("span", { class: "agent-title", text: title });
+  const body = el("div", { class: "agent-body" });
+  const root = el("details", { class: "agent running", open: "" },
+    el("summary", { class: "agent-head" }, el("span", { class: "spinner", "aria-hidden": "true" }), titleEl), body);
+  agentBlocks.set(id, { root, title: titleEl, body, files: new Map() });
+  messages.append(root);
+  updateWelcome();
+  messages.scrollTop = messages.scrollHeight;
+}
+
+/** Append one event: streamed text grows the last line of its kind, everything else is a new line. */
+function agentEvent(id: string, e: AgentEvent) {
+  const a = agentBlocks.get(id);
+  if (!a) return;
+  const follow = nearBottom();
+  let section = a.body;
+  if (e.file) {
+    let s = a.files.get(e.file);
+    if (!s) {
+      s = el("div", { class: "agent-file" }, el("div", { class: "agent-file-name", text: e.file }));
+      a.files.set(e.file, s);
+      a.body.append(s);
+    }
+    section = s;
+  }
+  if (e.kind === "start") {
+    section.querySelector(".agent-file-name")?.append(el("span", { class: "agent-dim", text: ` · ${e.text}` }));
+  } else if (e.kind === "text" || e.kind === "thinking") {
+    const last = section.lastElementChild;
+    const line = last?.classList.contains(`agent-${e.kind}`) ? last as HTMLElement
+      : section.appendChild(el("div", { class: `agent-${e.kind}` }));
+    line.textContent += e.text;
+    line.scrollTop = line.scrollHeight; // thinking scrolls inside its own box
+  } else if (e.kind === "tool") {
+    section.append(el("div", { class: "agent-tool" }, el("span", { class: "agent-bullet", text: "●" }), e.text));
+  } else if (e.kind === "result") {
+    section.append(el("div", { class: `agent-result${e.text.startsWith("Error") ? " error" : ""}`, text: `⎿ ${e.text}` }));
+  } else if (e.kind === "done") {
+    section.classList.add("done");
+    a.title.dataset.progress = e.text;
+  } else if (e.kind === "status") {
+    section.append(el("div", { class: "agent-status", text: e.text }));
+  }
+  if (follow) messages.scrollTop = messages.scrollHeight;
+}
+
+function agentEnd(id: string, title: string) {
+  const a = agentBlocks.get(id);
+  if (!a) return;
+  a.root.classList.remove("running");
+  a.root.querySelector(".spinner")?.remove();
+  a.title.textContent = title;
+  agentBlocks.delete(id);
+}
+
 function showError(text: string, action?: { label: string; command: string }) {
   const box = el("div", { class: "msg error" }, el("span", { text }));
   if (action) box.append(" ", actionButton(action));
@@ -274,12 +359,17 @@ function renderFindings() {
   const shown = findings.filter((f) => !ui.severities.includes(f.severity) && matches(f, ui.query));
   const notes: string[] = [];
   if (shown.length !== total) notes.push(`Showing ${shown.length} of ${total}.`);
-  if (hiddenFalsePositives) notes.push(`${hiddenFalsePositives} likely false alarms hidden (setting vulnScanner.showLikelyFalsePositives).`);
+  if (hiddenFalsePositives && total) notes.push(`${hiddenFalsePositives} likely false alarms hidden (setting vulnScanner.showLikelyFalsePositives).`);
   findingsNote.textContent = notes.join(" ");
   findingsNote.classList.toggle("hidden", !notes.length);
 
   findingsList.replaceChildren();
-  findingsEmpty.textContent = total ? "No findings match the filter." : "No findings yet. Ask me to scan this project in the Chat tab.";
+  findingsEmpty.replaceChildren(total ? "No findings match the filter."
+    : hiddenFalsePositives ? `No real problems found. ${hiddenFalsePositives} likely false alarm${hiddenFalsePositives === 1 ? " is" : "s are"} hidden. `
+    : "No findings yet. Ask me to scan this project in the Chat tab.");
+  if (!total && hiddenFalsePositives) {
+    findingsEmpty.append(button("Show them", "link", () => send({ type: "showFalsePositives", on: true })));
+  }
   findingsEmpty.classList.toggle("hidden", shown.length > 0);
 
   for (const sev of SEVERITIES) {
@@ -313,6 +403,10 @@ function renderFindings() {
     }
     findingsList.append(section);
   }
+}
+
+function isWorkspace() {
+  return sessions.find((s) => s.session_id === current)?.target_type === "workspace";
 }
 
 /** Findings appear before the LLM has reviewed them; until then the explanation is empty. */
@@ -369,6 +463,12 @@ function renderDetails(f: FindingView) {
   }
   const actions = el("div", { class: "detail-actions" },
     button("Open", "", () => send({ type: "openFinding", id: f.id }), f.web_url ? "Open on GitHub" : "Open in the editor"));
+  if (isWorkspace() && !pendingReview(f)) {
+    actions.append(button("Fix", "secondary", () => {
+      setTab("chat");
+      send({ type: "fix", ids: [f.id] });
+    }, "Let the assistant fix this in your code. You see the change before it is applied."));
+  }
   if (f.suggested_patch) actions.append(copyButton(() => f.suggested_patch ?? "", "secondary", "Copy patch"));
   actions.append(button("Ask in chat", "secondary", () => {
     setTab("chat");
@@ -408,6 +508,18 @@ search.addEventListener("input", () => {
 chatTab.onclick = () => setTab("chat");
 findingsTab.onclick = () => setTab("findings");
 stopBtn.onclick = () => send({ type: "cancel" });
+rescanBtn.onclick = () => {
+  setTab("chat");
+  send({ type: "runCommand", command: "vulnScanner.rescan" });
+};
+fixAllBtn.onclick = () => {
+  setTab("chat");
+  send({ type: "send", text: "Fix all findings" });
+};
+summarizeBtn.onclick = () => {
+  setTab("chat");
+  send({ type: "send", text: "Summarize all findings" });
+};
 newBtn.onclick = () => send({ type: "newSession" });
 deleteBtn.onclick = () => current && send({ type: "deleteSession", id: current });
 sessionSelect.onchange = () => sessionSelect.value && send({ type: "switchSession", id: sessionSelect.value });
@@ -447,6 +559,7 @@ window.addEventListener("message", (event: MessageEvent<ToWebview>) => {
       }
       current = msg.current;
       scanning = msg.scanning;
+      changedFiles = msg.changed;
       renderSessions();
       updateControls();
       break;
@@ -465,6 +578,15 @@ window.addEventListener("message", (event: MessageEvent<ToWebview>) => {
     case "message":
       renderMessage(msg.message);
       break;
+    case "agentStart":
+      agentStart(msg.id, msg.title);
+      break;
+    case "agentEvent":
+      agentEvent(msg.id, msg.event);
+      break;
+    case "agentEnd":
+      agentEnd(msg.id, msg.title);
+      break;
     case "thinking":
       thinking.classList.toggle("hidden", !msg.on);
       if (msg.on) messages.scrollTop = messages.scrollHeight;
@@ -479,6 +601,7 @@ window.addEventListener("message", (event: MessageEvent<ToWebview>) => {
       findings = msg.findings;
       hiddenFalsePositives = msg.hidden;
       renderFindings();
+      updateControls();
       // A finished scan brings new findings: show them.
       if (wasEmpty && findings.length && scanning) setTab("findings");
       break;

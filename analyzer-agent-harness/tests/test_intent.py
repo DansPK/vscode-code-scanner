@@ -40,7 +40,8 @@ async def test_chat_actions(harness_server, tokens):
             return await call(c, "chat", {"session_id": sid, "message": text})
 
         r = await say("scan my code", {"action": "scan"})
-        assert r["action"] == {"type": "scan", "full": False, "paths": [], "url": None, "confirm": False}
+        assert r["action"] == {"type": "scan", "full": False, "paths": [], "url": None, "confirm": False,
+                               "finding_ids": []}
         assert r["reply"] == "Starting a scan of the workspace."
 
         r = await say("is my login code safe?", {"action": "scan", "sure": False})

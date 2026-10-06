@@ -1,4 +1,4 @@
-"""Decide what a chat message asks for: start a scan, stop one, or just talk.
+"""Decide what a chat message asks for: start or stop a scan, fix findings, summarise them, or just talk.
 
 One short LLM call with a JSON reply (small local models handle that far better than tool calls).
 The result becomes the `action` of the chat reply, which the VS Code extension carries out:
@@ -15,14 +15,15 @@ from harness.llm import _loads_lenient
 
 log = logging.getLogger(__name__)
 
-ACTIONS = ("scan", "scan_workspace", "scan_github", "cancel", "none")
+ACTIONS = ("scan", "scan_workspace", "scan_github", "cancel", "fix", "summary", "none")
 MAX_FOLDERS_IN_PROMPT = 60
 
 SYSTEM = """You route messages in the chat of a code security scanner. Decide whether the user wants
-to START a scan, STOP the running scan, or is only asking or talking (no action).
+to START a scan, STOP the running scan, have findings FIXED in their code, get a SUMMARY of all
+findings, or is only asking or talking (no action).
 
 Reply with ONE JSON object and nothing else:
-{"action": "scan" | "scan_workspace" | "scan_github" | "cancel" | "none",
+{"action": "scan" | "scan_workspace" | "scan_github" | "cancel" | "fix" | "summary" | "none",
  "full": true or false,
  "paths": ["folder/or/file", ...],
  "url": "https://github.com/owner/repo" or null,
@@ -33,6 +34,9 @@ Reply with ONE JSON object and nothing else:
 - "scan_workspace": the user is in a GitHub session but wants their local workspace scanned.
 - "scan_github": the user gives a https://github.com/owner/repo link to scan. Put it in "url".
 - "cancel": stop / cancel / abort the running scan.
+- "fix": the user asks you to change their code to fix findings ("fix it", "fix all high findings",
+  "auto-fix src/db.py", "apply the fixes"). A question about HOW to fix something is "none".
+- "summary": the user wants an overview, summary or report of all the findings.
 - "none": questions about findings, code, security advice, greetings, anything else.
 - "full": true only if the user asks to scan everything again from scratch / a full scan.
 - "paths": only if the user names part of the project ("only the backend", "src/api"). Use the
@@ -128,6 +132,11 @@ def parse(text):
 
 async def decide(llm, message, session, files, has_scan, running, history=()):
     """Ask the model what the message wants. Unreadable answers count as "none" (just chat)."""
+    # Plain fix and summary commands need no model call.
+    for action, pattern in (("summary", SUMMARY_COMMAND), ("fix", FIX_COMMAND)):
+        if pattern.search(message):
+            log.info("intent: %s (command)", action)
+            return {"action": action, "full": False, "paths": [], "url": None, "sure": True}
     # No chat history here: small models copy earlier replies ("Starting a scan...") and misroute.
     # Confirmations go through Yes/No buttons, so the message alone is enough to decide.
     messages = [{"role": "system", "content": SYSTEM + "\n" + _context(session, project_folders(files), has_scan, running)},
@@ -143,6 +152,8 @@ async def decide(llm, message, session, files, has_scan, running, history=()):
         decision["sure"] = True
     # Same for "full": small models set it for any scan. Keep it only if the user asked for it.
     decision["full"] = decision["full"] and bool(FULL_WORDS.search(message))
+    if decision["action"] == "fix" and QUESTION.search(message):  # "how do I fix this?" is a question
+        decision["action"] = "none"
     log.info("intent: %s", json.dumps({k: v for k, v in decision.items() if k != "url"}))
     return decision
 
@@ -159,6 +170,11 @@ FULL_WORDS = re.compile(r"(?i)\b(from scratch|full(y)?\b|everything again|all (t
 
 CLEAR_COMMAND = re.compile(r"(?i)^\s*(please\s+)?(re-?scan|scan|stop|cancel|abort|check https://github\.com/)\b"
                            r"|\bscan again\b")
+
+
+SUMMARY_COMMAND = re.compile(r"(?i)^\s*(please\s+)?(summari[sz]e|summary|overview|report)\b")
+FIX_COMMAND = re.compile(r"(?i)^\s*(please\s+)?(auto[- ]?)?fix\b(?!\s+(it\s+)?myself)")
+QUESTION = re.compile(r"(?i)^\s*(how|what|why|where|when|which|is|are|does|do|should)\b")
 
 
 def _is_generic(path):

@@ -11,9 +11,11 @@ The scanning runs in Docker — Semgrep, Gitleaks and SonarQube Community Editio
 
 ## Highlights
 
-- **Chat-driven** — no scan buttons; an agent decides what each message means (scan, rescan, scan a GitHub repo, cancel, or just answer) and asks first when unsure.
+- **Chat-driven** — one Rescan button, everything else by chat; an agent decides what each message means (scan, rescan, scan a GitHub repo, cancel, or just answer) and asks first when unsure.
 - **Many languages** — Semgrep rules for Python, Java, Kotlin, C#, JavaScript, TypeScript, React (JSX/TSX), Go, PHP, Ruby, and more, plus Terraform, Dockerfiles and Kubernetes. Includes custom SQL-injection rules.
 - **Incremental** — a rescan uploads and scans only the files that changed; findings for the rest are kept.
+- **Fix agent** — ask "fix all high findings", or click **Fix** or **Fix all**. A coding agent reads the code, edits what is needed (also other files, such as imports), reruns the scanners to confirm, and reports per finding. You see every change as a diff, and nothing is written until you apply it.
+- **Summary** — after every scan, a short summary: counts, the most affected files, and up to three things to fix first. Ask "summarize" for it again.
 - **Live results** — findings appear as each scanner finishes, and the LLM review fills in per finding.
 - **Private** — the code and the LLM stay on your own infrastructure.
 

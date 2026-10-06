@@ -4,12 +4,14 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { formatBytes } from "./archive";
 import { HarnessClient, ServerUnreachableError, TOKEN_REJECTED, TokenRejectedError, ToolCallError } from "./client";
-import { diagnosticLevel, diagnosticMessage, scanSummaryText, sortFindings, splitHidden } from "./findingsLogic";
+import { applyEdits, diagnosticLevel, diagnosticMessage, mergeEdits, parseAgentEvent, scanSummaryText, sortFindings,
+  splitHidden } from "./findingsLogic";
 import { makeFetch } from "./http";
 import { log } from "./log";
 import { route } from "./routing";
 import { fetchAllFindings, prepareWorkspace, TooLargeError, watchToEnd } from "./scanFlow";
-import type { ChatAction, ChatMessage, Finding, SessionInfo } from "./shared/contract";
+import type { ChatAction, ChatMessage, FileFix, Finding, FixOutcome, FixResult, ScanSummary, SessionInfo }
+  from "./shared/contract";
 import type { ConnectionStatus, FindingView, ToExtension, ToWebview } from "./shared/messages";
 import { UploadError } from "./upload";
 import { CancelledError, hashFile } from "./workspaceFiles";
@@ -18,7 +20,11 @@ export const TOKEN_KEY = "vulnScanner.token";
 const LAST_SESSION_KEY = "vulnScanner.lastSession";
 const SESSION_FOLDERS_KEY = "vulnScanner.sessionFolders";
 const LIVE_REFRESH_MS = 1500;
-const SUGGEST_RESCAN_AFTER_MS = 4000;
+const FIX_SCHEME = "vulnscanner-fix";
+const OUTCOME_LABEL: Record<FixOutcome["status"], string> = {
+  fixed: "✅ fixed:", still_reported: "⚠️ still reported:", not_verified: "🔎 changed, rescan to confirm:",
+  not_fixed: "⏭️ not changed:",
+};
 
 export interface ScanOptions {
   full?: boolean;
@@ -28,7 +34,7 @@ export interface ScanOptions {
 /** The keyword rules, used only when the agent cannot be reached. */
 function keywordAction(text: string): ChatAction | null {
   const r = route(text);
-  const base = { full: false, paths: [], url: null, confirm: false };
+  const base = { full: false, paths: [], url: null, confirm: false, finding_ids: [] };
   if (r.kind === "github") return { ...base, type: "scan_github", url: r.url };
   if (r.kind === "rescan" || r.kind === "scan") return { ...base, type: "scan" };
   if (/^\s*(stop|cancel|abort)\b/i.test(text)) return { ...base, type: "cancel" };
@@ -53,17 +59,24 @@ export class Controller implements vscode.Disposable {
   private scanning: RunningScan | null = null;
   private busy = false;
   private findings: Finding[] = [];
+  private hiddenCount = 0; // likely false alarms hidden by the setting
   private readonly diagnostics: vscode.DiagnosticCollection;
   private views: View[] = [];
   private connecting?: Promise<boolean>;
+  /** Proposed file contents shown on the right of a fix diff, by virtual URI. */
+  private readonly proposed = new Map<string, string>();
+  private readonly fixDocs: vscode.Disposable;
 
   constructor(private readonly ctx: vscode.ExtensionContext) {
     this.diagnostics = vscode.languages.createDiagnosticCollection("vulnScanner");
+    this.fixDocs = vscode.workspace.registerTextDocumentContentProvider(FIX_SCHEME, {
+      provideTextDocumentContent: (uri) => this.proposed.get(uri.toString()) ?? "",
+    });
   }
 
   dispose() {
-    clearTimeout(this.suggestTimer);
     this.diagnostics.dispose();
+    this.fixDocs.dispose();
     this.scanning?.abort.abort();
     void this.client?.close();
   }
@@ -79,7 +92,7 @@ export class Controller implements vscode.Disposable {
 
   private postState() {
     this.post({ type: "state", connection: this.connection, sessions: this.sessions, current: this.current,
-                scanning: this.scanning !== null, busy: this.busy });
+                scanning: this.scanning !== null, busy: this.busy, changed: this.editedWithFindings.size });
   }
 
   private say(text: string, role: ChatMessage["role"] = "assistant") {
@@ -222,6 +235,10 @@ export class Controller implements vscode.Disposable {
         case "renameSession": return await this.renameSession(msg.id, msg.name);
         case "deleteSession": return await this.deleteSession(msg.id);
         case "openFinding": return await this.openFinding(msg.id);
+        case "fix": return await this.fixFindings(msg.ids);
+        case "showFalsePositives":
+          return await vscode.workspace.getConfiguration("vulnScanner")
+            .update("showLikelyFalsePositives", msg.on, vscode.ConfigurationTarget.Global);
         case "runCommand":
           if (msg.command.startsWith("vulnScanner.")) await vscode.commands.executeCommand(msg.command);
           return;
@@ -273,44 +290,31 @@ export class Controller implements vscode.Disposable {
     if (reply.action) await this.offerAction(reply.action);
   }
 
-  private pending = new Map<string, () => Promise<void>>();
+  private pending = new Map<string, { onYes: () => Promise<void>; onNo?: () => void }>();
   private editedWithFindings = new Set<string>();
-  private alreadySuggested = new Set<string>();
-  private suggestTimer?: NodeJS.Timeout;
 
-  /** After you save files that have findings, offer a rescan (once per file until the next scan). */
+  /** Saved files that have findings light up the Rescan button (no chat message). */
   onSaved(uri: vscode.Uri) {
     const s = this.currentSession();
     if (!s || s.target_type !== "workspace" || uri.scheme !== "file") return;
     const folder = this.sessionFolder(s.session_id);
     if (!folder) return;
     const rel = path.relative(folder, uri.fsPath).split(path.sep).join("/");
-    if (rel.startsWith("..") || this.alreadySuggested.has(rel) || !this.findings.some((f) => f.path === rel)) return;
+    if (rel.startsWith("..") || this.editedWithFindings.has(rel) || !this.findings.some((f) => f.path === rel)) return;
     this.editedWithFindings.add(rel);
-    clearTimeout(this.suggestTimer);
-    this.suggestTimer = setTimeout(() => this.suggestRescan(), SUGGEST_RESCAN_AFTER_MS);
-  }
-
-  private suggestRescan() {
-    if (this.scanning || this.busy || !this.editedWithFindings.size) return;
-    const files = [...this.editedWithFindings];
-    this.editedWithFindings.clear();
-    files.forEach((f) => this.alreadySuggested.add(f));
-    const list = files.slice(0, 3).map((f) => `\`${f}\``).join(", ") + (files.length > 3 ? ` and ${files.length - 3} more` : "");
-    this.say(`You changed ${files.length === 1 ? "a file" : `${files.length} files`} with findings (${list}). `
-      + "Want me to rescan to see if they are fixed?");
-    this.ask("Rescan", () => this.rescan());
+    this.postState();
   }
 
   /** Run an action, or ask first with Yes/No buttons when the agent was not sure. */
   private async offerAction(action: ChatAction) {
     if (!action.confirm) return this.runAction(action);
-    this.ask(action.type === "cancel" ? "Stop the scan" : "Yes, scan", () => this.runAction(action));
+    const yes = { cancel: "Stop the scan", fix: "Yes, fix them" }[action.type as string] ?? "Yes, scan";
+    this.ask(yes, () => this.runAction(action));
   }
 
-  private ask(yes: string, onYes: () => Promise<void>, no = "No") {
+  private ask(yes: string, onYes: () => Promise<void>, no = "No", onNo?: () => void) {
     const id = Math.random().toString(36).slice(2);
-    this.pending.set(id, onYes);
+    this.pending.set(id, { onYes, onNo });
     this.post({ type: "confirm", id, yes, no });
   }
 
@@ -319,13 +323,15 @@ export class Controller implements vscode.Disposable {
     this.pending.delete(id);
     this.post({ type: "confirmDone", id });
     if (!run) return;
-    if (accept) await run();
+    if (accept) await run.onYes();
+    else if (run.onNo) run.onNo();
     else this.say("OK, I won't.");
   }
 
   private async runAction(a: ChatAction) {
     const opts = { full: a.full, paths: a.paths };
     switch (a.type) {
+      case "fix": return this.fixFindings(a.finding_ids ?? []);
       case "cancel": return this.cancelScan();
       case "scan_github": return this.scanGithub(a.url!, opts);
       case "scan_workspace": return this.scanWorkspace(opts);
@@ -526,6 +532,29 @@ export class Controller implements vscode.Disposable {
     await this.follow(client, s!.session_id, scan_id);
   }
 
+  /** After a scan: the harness's short summary, with what only the extension knows (hidden findings,
+   * scan errors). If the summary cannot be made, the plain counts. */
+  private async showScanSummary(client: HarnessClient, sessionId: string, counts: ScanSummary["counts"],
+                                error: string | null) {
+    const tail: string[] = [];
+    if (this.hiddenCount) {
+      tail.push(`_${this.hiddenCount} likely false alarm${this.hiddenCount === 1 ? " is" : "s are"} hidden in the Findings tab._`);
+    }
+    if (error) tail.push(`Some steps had problems: ${error}`);
+    this.post({ type: "thinking", on: true });
+    try {
+      const s = await client.summarizeFindings(sessionId);
+      this.post({ type: "message", message: { role: "assistant", text: [s.summary, ...tail].join("\n\n"),
+                                              finding_ids: s.finding_ids } });
+    } catch (e) {
+      log.warn(`Summary failed: ${(e as Error).message}`);
+      const newCount = this.findings.filter((f) => f.status === "new").length;
+      this.say(scanSummaryText(counts, newCount, error, this.hiddenCount));
+    } finally {
+      this.post({ type: "thinking", on: false });
+    }
+  }
+
   private async follow(client: HarnessClient, sessionId: string, scanId: string) {
     const abort = new AbortController();
     this.scanning = { scanId, sessionId, abort };
@@ -541,8 +570,7 @@ export class Controller implements vscode.Disposable {
       this.post({ type: "progress", percent: summary.percent, message: summary.status, done: true });
       if (summary.status === "done") {
         await this.loadFindings();
-        const newCount = this.findings.filter((f) => f.status === "new").length;
-        this.say(scanSummaryText(summary.counts, newCount, summary.error));
+        await this.showScanSummary(client, sessionId, summary.counts, summary.error);
       } else if (summary.status === "cancelled") {
         this.say("The scan was cancelled.");
       } else {
@@ -550,7 +578,6 @@ export class Controller implements vscode.Disposable {
       }
     } finally {
       this.scanning = null;
-      this.alreadySuggested.clear();
       this.editedWithFindings.clear();
       await this.refreshSessions().catch(() => undefined);
       this.postState();
@@ -621,6 +648,7 @@ export class Controller implements vscode.Disposable {
       ...f, outdated: folder ? await this.isOutdated(folder, f) : false,
     })));
     const { shown, hidden } = splitHidden(views, this.settings().showLikelyFalsePositives);
+    this.hiddenCount = hidden;
     this.post({ type: "findings", findings: shown, hidden, total: views.length });
     this.updateDiagnostics(folder, shown);
   }
@@ -666,6 +694,166 @@ export class Controller implements vscode.Disposable {
       await this.connect();
     }
     else if (e.affectsConfiguration("vulnScanner.showLikelyFalsePositives") && this.client) await this.loadFindings();
+  }
+
+  // --- auto-fix ---
+
+  /** Let the fix agent on the harness fix findings, then show its changes: one file as a diff with
+   * Apply/Skip; several files with a choice of applying all at once or reviewing them one by one.
+   * Changes apply only to a saved file that still has the hash the agent worked from. */
+  async fixFindings(ids: string[]) {
+    if (!ids.length) return;
+    const s = this.currentSession();
+    if (s?.target_type !== "workspace") {
+      this.say("Auto-fix works only for workspace sessions, because it changes files in your open folder.");
+      return;
+    }
+    const folder = this.sessionFolder(s.session_id);
+    if (!folder) {
+      this.say("I don't know which folder this session belongs to. Open that folder and rescan.");
+      return;
+    }
+    if (this.scanning) throw new ToolCallError("A scan is running. Fix findings after it finishes.");
+    const client = await this.ready();
+    const sessionId = s.session_id;
+
+    let result: FixResult | undefined;
+    const abort = new AbortController();
+    const live = Math.random().toString(36).slice(2);
+    const started = Date.now();
+    let ended = "Fix agent stopped";
+    this.busy = true;
+    this.postState();
+    this.post({ type: "agentStart", id: live, title: `Fix agent · ${ids.length} finding${ids.length === 1 ? "" : "s"}` });
+    try {
+      result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
+                                                  title: "Vuln Scanner: fix agent", cancellable: true },
+        async (progress, token) => {
+          token.onCancellationRequested(() => abort.abort());
+          let last = 0;
+          return client.fixFindings(sessionId, ids, (percent, message) => {
+            const event = parseAgentEvent(message);
+            if (event.kind === "heartbeat") return;
+            this.post({ type: "agentEvent", id: live, event });
+            const line = event.kind === "tool" || event.kind === "status" || event.kind === "done"
+              ? `${event.file ? `${path.basename(event.file)}: ` : ""}${event.text}` : undefined;
+            progress.report({ message: line, increment: Math.max(0, percent - last) });
+            last = Math.max(last, percent);
+          }, abort.signal);
+        });
+      ended = `Fix agent finished in ${Math.round((Date.now() - started) / 1000)} s`;
+    } finally {
+      this.busy = false;
+      this.post({ type: "agentEnd", id: live, title: ended });
+      this.postState();
+    }
+    if (!result) return;
+
+    const counts = { fixed: 0, still_reported: 0, not_verified: 0, not_fixed: 0 };
+    for (const r of result.results) counts[r.status]++;
+    const outcome = (r: FixOutcome) => `- ${OUTCOME_LABEL[r.status]} ${this.findingTitle(r.finding_id)}: ${r.note}`;
+    const parts = [`**Fix agent:** ${counts.fixed} fixed and confirmed by the scanners`
+      + (counts.not_verified ? `, ${counts.not_verified} changed but not rechecked (SonarQube)` : "")
+      + (counts.still_reported ? `, ${counts.still_reported} still reported` : "")
+      + (counts.not_fixed ? `, ${counts.not_fixed} not changed` : "") + "."];
+    if (result.summary) parts.push(result.summary);
+    const problems = result.results.filter((r) => r.status === "still_reported" || r.status === "not_fixed");
+    if (problems.length) parts.push(problems.slice(0, 15).map(outcome).join("\n"));
+    this.say(parts.join("\n\n"));
+
+    const files = [...result.files].sort((x, y) => x.path.localeCompare(y.path));
+    const byPath = new Map(result.results.map((r) => [r.finding_id, r]));
+    const review = () => void this.reviewFileFixes(folder, files, byPath).catch((e) => this.showError(e));
+    if (files.length === 1) return review();
+    if (!files.length) return;
+    this.say(`The agent changed ${files.length} files. Apply them all now, or review each file's diff first? `
+      + "(Ctrl+Z in each file undoes a change.)");
+    this.ask(`Apply all (${files.length} files)`, () => this.applyAllFixes(folder, files), "Review one by one", review);
+  }
+
+  private findingTitle(id: string) {
+    const f = this.findings.find((x) => x.id === id);
+    return f ? `**${f.title}** (${f.path}:${f.start_line})` : `\`${id}\``;
+  }
+
+  /** The fixed text of one file, or a reason it cannot be changed now. */
+  private async prepareFileFix(folder: string, fix: FileFix) {
+    const rel = fix.path;
+    const uri = vscode.Uri.file(path.join(folder, rel));
+    let doc: vscode.TextDocument;
+    try {
+      doc = await vscode.workspace.openTextDocument(uri);
+    } catch {
+      return { problem: `\`${rel}\` no longer exists.` };
+    }
+    if (doc.isDirty) return { problem: `\`${rel}\` has unsaved changes. Save it, rescan, and ask again.` };
+    if ((await hashFile(uri.fsPath)) !== fix.file_sha256) {
+      return { problem: `\`${rel}\` changed since it was last uploaded, so the change may not fit. Rescan, then ask again.` };
+    }
+    const { kept, dropped } = mergeEdits(fix.edits);
+    const original = doc.getText();
+    try {
+      return { uri, original, fixed: applyEdits(original, kept), kept, dropped };
+    } catch (e) {
+      return { problem: `The change to \`${rel}\` doesn't fit the file (${(e as Error).message}). Rescan, then ask again.` };
+    }
+  }
+
+  /** Write the fixed text if the file is still what the fix was made for. Returns an error, or null. */
+  private async writeFileFix(rel: string, fix: { uri: vscode.Uri; original: string; fixed: string; kept: unknown[] }) {
+    const now = await vscode.workspace.openTextDocument(fix.uri);
+    if (now.getText() !== fix.original) return `\`${rel}\` changed in the meantime. Ask again to get a fresh fix.`;
+    const edit = new vscode.WorkspaceEdit();
+    edit.replace(fix.uri, new vscode.Range(now.positionAt(0), now.positionAt(fix.original.length)), fix.fixed);
+    if (!(await vscode.workspace.applyEdit(edit)) || !(await now.save())) return `Could not write \`${rel}\`.`;
+    log.info(`Applied ${fix.kept.length} fix edit(s) to ${rel}`);
+    return null;
+  }
+
+  private async applyAllFixes(folder: string, files: FileFix[]) {
+    let applied = 0;
+    const problems: string[] = [];
+    for (const file of files) {
+      const fix = await this.prepareFileFix(folder, file);
+      const problem = "problem" in fix ? fix.problem : await this.writeFileFix(file.path, fix);
+      if (problem) problems.push(`- ${problem}`);
+      else applied++;
+    }
+    this.say(`Applied changes to ${applied} of ${files.length} files. Rescan to check them.`
+      + (problems.length ? `\n\nNot applied:\n${problems.join("\n")}` : ""));
+  }
+
+  /** One file at a time: open its diff, wait for Apply or Skip, then go on to the next. */
+  private async reviewFileFixes(folder: string, files: FileFix[], outcomes: Map<string, FixOutcome>) {
+    for (const [i, file] of files.entries()) {
+      const rel = file.path;
+      const fix = await this.prepareFileFix(folder, file);
+      if ("problem" in fix) {
+        this.say(fix.problem!);
+        continue;
+      }
+      const right = vscode.Uri.from({ scheme: FIX_SCHEME, path: `/${rel}`, query: Math.random().toString(36).slice(2) });
+      this.proposed.set(right.toString(), fix.fixed);
+      await vscode.commands.executeCommand("vscode.diff", fix.uri, right, `${path.basename(rel)}: proposed fix`,
+                                           { preview: true });
+      const here = this.findings.filter((f) => f.path === rel && outcomes.has(f.id))
+        .map((f) => `- ${OUTCOME_LABEL[outcomes.get(f.id)!.status]} ${this.findingTitle(f.id)}`);
+      if (fix.dropped.length) here.push(`- ${fix.dropped.length} overlapping edit(s) were left out.`);
+      const counter = files.length > 1 ? ` (file ${i + 1} of ${files.length})` : "";
+      this.say(`Proposed fix for \`${rel}\`${counter} (see the diff)${here.length ? `:\n${here.join("\n")}` : "."}`);
+      await new Promise<void>((resolve) => this.ask("Apply fix", async () => {
+        this.proposed.delete(right.toString());
+        const problem = await this.writeFileFix(rel, fix);
+        if (problem) this.post({ type: "error", message: problem.replace(/`/g, "") });
+        else this.say(`Applied the fix to \`${rel}\` (Ctrl+Z in the editor undoes it).`
+          + (i === files.length - 1 ? " Rescan to check it." : ""));
+        resolve();
+      }, "Skip", () => {
+        this.proposed.delete(right.toString());
+        this.say(`Skipped \`${rel}\`.`);
+        resolve();
+      }));
+    }
   }
 
   async openFinding(id: string) {

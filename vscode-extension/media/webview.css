@@ -69,8 +69,7 @@ a { color: var(--vscode-textLink-foreground); }
 .progress .bar { height: 3px; background: var(--vscode-progressBar-background); transition: width 0.3s; }
 
 /* --- tabs --- */
-.tabs { display: flex; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 2;
-        background: var(--vscode-sideBar-background); }
+.tabs { display: flex; }
 .tab { background: none; color: var(--muted); padding: 6px 10px; border-radius: 0;
        border-bottom: 2px solid transparent; margin-bottom: -1px; display: flex; gap: 6px; align-items: center; }
 .tab:hover:not(:disabled) { background: none; color: var(--vscode-foreground); }
@@ -114,6 +113,8 @@ code { font-family: var(--vscode-editor-font-family); font-size: 0.92em; }
 /* --- findings --- */
 .filters { display: flex; flex-direction: column; gap: 6px; }
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.filter-row { display: flex; align-items: flex-start; gap: 6px; }
+.filter-row .chips { flex: 1; }
 .chip { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 12px;
         background: var(--vscode-editor-background); color: var(--vscode-foreground); border: 1px solid var(--border);
         font-size: 0.85em; }
@@ -177,3 +178,34 @@ code { font-family: var(--vscode-editor-font-family); font-size: 0.92em; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .facts { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 8px; font-size: 0.78em; color: var(--muted);
          font-family: var(--vscode-editor-font-family); overflow-wrap: anywhere; }
+
+/* Fix agent transcript, like a coding agent's terminal output */
+.agent { border: 1px solid var(--border); border-radius: var(--radius); background: var(--vscode-editor-background);
+         font-family: var(--vscode-editor-font-family, monospace); font-size: 0.92em; }
+.agent-head { padding: 6px 10px; cursor: pointer; display: flex; align-items: center; gap: 8px;
+              font-family: var(--vscode-font-family); font-weight: 600; }
+.agent-title[data-progress]::after { content: " · " attr(data-progress); font-weight: normal; opacity: 0.7; }
+.agent-body { padding: 0 10px 8px; display: flex; flex-direction: column; gap: 6px; }
+.agent-file { display: flex; flex-direction: column; gap: 2px; }
+.agent-file-name { font-weight: 600; }
+.agent-file.done .agent-file-name::before { content: "✓ "; color: var(--vscode-charts-green, #3fb950); }
+.agent-dim, .agent-status { opacity: 0.7; font-weight: normal; }
+.agent-thinking { opacity: 0.6; font-style: italic; white-space: pre-wrap; max-height: 6.5em; overflow-y: auto;
+                  border-left: 2px solid var(--border); padding-left: 8px; }
+.agent-text { white-space: pre-wrap; }
+.agent-tool { display: flex; gap: 6px; }
+.agent-bullet { color: var(--vscode-charts-green, #3fb950); }
+.agent.running .agent-file:not(.done) .agent-tool:last-of-type .agent-bullet { animation: agent-pulse 1s ease-in-out infinite; }
+.agent-result { padding-left: 14px; opacity: 0.75; }
+.agent-result.error { color: var(--vscode-errorForeground); opacity: 1; }
+.spinner { width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--vscode-progressBar-background, #0e70c0);
+           border-right-color: transparent; animation: agent-spin 0.8s linear infinite; flex: none; }
+@keyframes agent-spin { to { transform: rotate(360deg); } }
+@keyframes agent-pulse { 50% { opacity: 0.3; } }
+@media (prefers-reduced-motion: reduce) { .spinner, .agent-bullet { animation: none !important; } }
+
+.tab-bar { display: flex; align-items: center; gap: 6px; border-bottom: 1px solid var(--border); position: sticky;
+           top: 0; z-index: 2; background: var(--vscode-sideBar-background); }
+.tab-bar .tabs { flex: 1; }
+.rescan.attention { background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+                    border-color: var(--vscode-button-background); }

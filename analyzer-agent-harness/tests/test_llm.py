@@ -52,6 +52,11 @@ async def test_second_run_uses_cache(vuln_app, cfg, store):
     again = [_finding(vuln_app)]
     n, _ = await llm.review_findings(again, vuln_app, llm.LLM(cfg, fake), store, 1)
     assert n == 0 and len(fake.calls) == 1 and again[0]["verdict"] == "likely_real"
+    # A different model reviews again
+    import dataclasses
+    other = dataclasses.replace(cfg, llm_model="openai/bigger-model")
+    n, _ = await llm.review_findings([_finding(vuln_app)], vuln_app, llm.LLM(other, fake), store, 1)
+    assert n == 1 and len(fake.calls) == 2
 
 
 async def test_unreachable_llm_stops_early(vuln_app, cfg, store):
@@ -176,3 +181,72 @@ def test_parse_review_odd_patch_shapes():
     assert llm.parse_review(base % '["a = 1", "b = 2"]')["suggested_patch"] == "a = 1\nb = 2"
     assert llm.parse_review(base % "{'old': {1, 2}}")["suggested_patch"]  # set inside a dict: no crash
     assert llm.parse_review(base % "42")["suggested_patch"] == "42"
+
+
+async def test_server_errors_are_retried_and_never_show_the_url(cfg, monkeypatch):
+    import litellm
+    calls, sleeps = [], []
+
+    async def no_sleep(s):
+        sleeps.append(s)
+    monkeypatch.setattr(llm.asyncio, "sleep", no_sleep)
+
+    def failing(*errors):
+        async def fake(**kw):
+            calls.append(1)
+            if len(calls) <= len(errors):
+                raise errors[len(calls) - 1]
+            msg = type("M", (), {"content": "ok", "tool_calls": None})
+            return type("R", (), {"choices": [type("C", (), {"message": msg})]})
+        return fake
+
+    boom = litellm.InternalServerError("upstream 500 at https://secret.example/v1", "openai", "m")
+    monkeypatch.setattr(litellm, "acompletion", failing(boom, boom))
+    assert (await llm.LLM(cfg).complete([]))["content"] == "ok"  # third try works
+    assert sleeps == [2, 4]
+
+    calls.clear()
+    monkeypatch.setattr(litellm, "acompletion", failing(boom, boom, boom))
+    with pytest.raises(llm.LLMError) as e:
+        await llm.LLM(cfg).complete([])
+    assert not isinstance(e.value, llm.LLMUnreachable) and "HTTP 500" in str(e.value)
+
+    calls.clear()
+    down = litellm.APIConnectionError("refused by https://secret.example/v1", "openai", "m")
+    monkeypatch.setattr(litellm, "acompletion", failing(down, down))
+    with pytest.raises(llm.LLMUnreachable) as e:
+        await llm.LLM(cfg).complete([])
+    assert len(calls) == 2 and "http" not in str(e.value) and cfg.llm_base_url not in str(e.value)
+
+    calls.clear()
+    bad = litellm.BadRequestError("bad model, see https://secret.example/v1/docs", "m", "openai")
+    monkeypatch.setattr(litellm, "acompletion", failing(bad))
+    with pytest.raises(llm.LLMError) as e:
+        await llm.LLM(cfg).complete([])
+    assert "secret.example" not in str(e.value)
+
+
+async def test_streaming_passes_text_on_and_rebuilds_the_reply(cfg, monkeypatch):
+    import litellm
+    from types import SimpleNamespace as NS
+    chunks = [NS(choices=[NS(delta=NS(content=t, reasoning_content=r))])
+              for t, r in ((None, "Need to look"), ("I'll read ", None), ("the file.", None))]
+
+    async def stream():
+        for c in chunks:
+            yield c
+
+    async def fake(**kw):
+        assert kw.get("stream") is True
+        return stream()
+    built = NS(choices=[NS(message=NS(content="I'll read the file.", tool_calls=[
+        NS(id="t1", function=NS(name="read_file", arguments='{"path": "a.py"}'))]))])
+    monkeypatch.setattr(litellm, "acompletion", fake)
+    monkeypatch.setattr(litellm, "stream_chunk_builder", lambda cs, messages=None: built if len(cs) == 3 else None)
+    deltas = []
+
+    async def on_text(d, thinking):
+        deltas.append((d, thinking))
+    r = await llm.LLM(cfg).complete([{"role": "user", "content": "x"}], tools=[{}], on_text=on_text)
+    assert deltas == [("Need to look", True), ("I'll read ", False), ("the file.", False)]
+    assert r == {"content": "I'll read the file.", "tool_calls": [{"id": "t1", "name": "read_file", "arguments": '{"path": "a.py"}'}]}

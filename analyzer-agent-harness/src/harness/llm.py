@@ -15,6 +15,7 @@ VERDICTS = ("likely_real", "likely_false_positive", "unsure")
 REVIEW_CONTEXT_LINES = 20  # lines on each side, about 40 in total
 CHARS_PER_TOKEN = 4
 RESERVED_TOKENS = 2000  # instructions plus the reply
+BUSY_ATTEMPTS = 3  # tries when the LLM server answers with 5xx or 429
 
 
 class LLMError(Exception):
@@ -33,21 +34,44 @@ class LLM:
         self.cfg = cfg
         self._completion = completion or self._litellm
 
-    async def _litellm(self, messages, tools=None):
+    async def _litellm(self, messages, tools=None, on_text=None):
         import litellm
+        litellm.suppress_debug_info = True  # it prints a "Provider List" banner to stdout otherwise
         kwargs = dict(model=self.cfg.llm_model, messages=messages, api_base=self.cfg.llm_base_url,
                       api_key=self.cfg.llm_api_key, timeout=self.cfg.llm_timeout_seconds)
         if tools:
             kwargs["tools"] = tools
-        network_errors = (litellm.APIConnectionError, litellm.Timeout,
-                          litellm.ServiceUnavailableError, litellm.InternalServerError)
-        for attempt in (1, 2):
+        # Cannot connect: retry once, then the LLM counts as down (the scan stops asking it).
+        # The server answered with an error (5xx, 429): usually brief, so retry with backoff,
+        # and if it keeps failing, only this call fails.
+        unreachable = (litellm.APIConnectionError, litellm.Timeout)
+        busy = (litellm.ServiceUnavailableError, litellm.InternalServerError, litellm.RateLimitError)
+        for attempt in range(1, BUSY_ATTEMPTS + 1):
             try:
-                resp = await litellm.acompletion(**kwargs)
+                if on_text is None:
+                    resp = await litellm.acompletion(**kwargs)
+                else:  # stream: pass text on as it arrives, then rebuild the whole reply
+                    chunks = []
+                    async for chunk in await litellm.acompletion(**kwargs, stream=True):
+                        chunks.append(chunk)
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        thinking = getattr(delta, "reasoning_content", None) if delta else None
+                        if thinking:  # reasoning models stream their thinking separately
+                            await on_text(thinking, True)
+                        if delta and delta.content:
+                            await on_text(delta.content, False)
+                    resp = litellm.stream_chunk_builder(chunks, messages=messages)
                 break
-            except network_errors as e:
-                if attempt == 2:
-                    raise LLMUnreachable(f"The LLM cannot be reached at {self.cfg.llm_base_url}") from e
+            except busy as e:  # before `unreachable`: some of these subclass APIConnectionError
+                if attempt == BUSY_ATTEMPTS:
+                    raise LLMError(f"The LLM server returned an error (HTTP {getattr(e, 'status_code', '?')}) "
+                                   f"{BUSY_ATTEMPTS} times. Try again in a minute.") from e
+                log.warning("LLM server error (%s), retrying", type(e).__name__)
+                await asyncio.sleep(2 ** attempt)
+            except unreachable as e:
+                if attempt >= 2:
+                    # No URL in the message: it is shown to users and may be private.
+                    raise LLMUnreachable("The LLM cannot be reached. Check LLM_BASE_URL on the scanner server.") from e
                 log.warning("LLM call failed (%s), retrying once", type(e).__name__)
                 await asyncio.sleep(1)
             except Exception as e:  # any other LiteLLM/OpenAI error (400s, bad output from the server)
@@ -58,8 +82,17 @@ class LLM:
                  for c in (getattr(msg, "tool_calls", None) or [])]
         return {"content": msg.content, "tool_calls": calls}
 
-    async def complete(self, messages, tools=None):
-        return await self._completion(messages, tools)
+    async def complete(self, messages, tools=None, on_text=None):
+        """`on_text(delta, thinking)` is awaited with the reply's text as it streams in;
+        `thinking` is true for a reasoning model's thinking, which is not part of the reply."""
+        if on_text is None:
+            return await self._completion(messages, tools)
+        if self._completion == self._litellm:
+            return await self._litellm(messages, tools, on_text)
+        reply = await self._completion(messages, tools)  # test doubles do not stream: one delta
+        if reply.get("content"):
+            await on_text(reply["content"], False)
+        return reply
 
     @property
     def max_code_chars(self):
@@ -67,8 +100,8 @@ class LLM:
 
 
 def _short(e):
-    """A short, single-line reason from an LLM error, without request details."""
-    text = str(e).replace("\n", " ")
+    """A short, single-line reason from an LLM error, without request details or URLs."""
+    text = re.sub(r"https?://\S+", "<url>", str(e).replace("\n", " "))
     for marker in ('"message":"', "'message': '", "message="):
         if marker in text:
             text = text.split(marker, 1)[1]
@@ -176,12 +209,12 @@ async def review_one(llm, finding, code_dir):
 
 
 async def review_findings(findings, code_dir, llm, db, max_parallel, on_progress=None):
-    """Fill the LLM fields of every finding. Cached reviews (same id and file hash)
+    """Fill the LLM fields of every finding. Cached reviews (same id, file hash and model)
     are reused without calling the LLM. `on_progress(done, total, finding)` is awaited after each review.
     Returns (reviews attempted, error message or None)."""
     todo = []
     for f in findings:
-        cached = db.get_review(f["id"], f["file_sha256"])
+        cached = db.get_review(f["id"], f["file_sha256"], llm.cfg.llm_model)
         if cached:
             f.update(cached)
         else:
@@ -206,7 +239,7 @@ async def review_findings(findings, code_dir, llm, db, max_parallel, on_progress
                     log.exception("review of a finding failed unexpectedly")
         f.update(review or FAILED_REVIEW)
         if review:  # only cache real reviews, so a failed one is retried next scan
-            db.put_review(f["id"], f["file_sha256"], review)
+            db.put_review(f["id"], f["file_sha256"], llm.cfg.llm_model, review)
         done += 1
         if on_progress:
             await on_progress(done, len(todo), f)

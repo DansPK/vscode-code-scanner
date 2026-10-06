@@ -123,7 +123,7 @@ class ScanManager:
                     f["status"] = "existing" if f["id"] in before else "new"
                     if plan.get("web_base"):
                         f["web_url"] = f"{plan['web_base']}/{f['path']}#L{f['start_line']}-L{f['end_line']}"
-                    cached = self.db.get_review(f["id"], f["file_sha256"])
+                    cached = self.db.get_review(f["id"], f["file_sha256"], self.llm.cfg.llm_model)
                     if cached:
                         f.update(cached)
                 self.db.save_findings(run.scan_id, sid, found, replace=True)
@@ -164,7 +164,7 @@ class ScanManager:
                     f["web_url"] = f"{plan['web_base']}/{f['path']}#L{f['start_line']}-L{f['end_line']}"
             # Store the full list before the slow LLM step; reviews then fill in one by one.
             for f in findings:
-                cached = self.db.get_review(f["id"], f["file_sha256"])
+                cached = self.db.get_review(f["id"], f["file_sha256"], self.llm.cfg.llm_model)
                 if cached:
                     f.update(cached)
             self.db.save_findings(run.scan_id, sid, findings, replace=True)

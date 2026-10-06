@@ -63,7 +63,8 @@ test("scan this project: progress, summary, findings, Problems panel, open at li
   assert.ok(liveLists.some((m) => m.findings.some((f) => f.explanation === "")),
     "findings were shown before their review finished");
   assert.ok(posted.some((m) => m.type === "progress" && !m.done), "progress lines");
-  assert.ok(texts().some((t) => /Scan finished/.test(t)), "summary");
+  assert.ok(texts().some((t) => t.startsWith("**2 findings.** Fix the SQL injection first.")
+    && /1 likely false alarm is hidden/.test(t)), "short summary shown by itself after the scan");
   assert.ok(texts().some((t) => /sonarqube/.test(t)), "failed scanner is named");
   const f = last("findings")!;
   assert.equal(f.total, 2);
@@ -144,17 +145,15 @@ test("when the LLM is down, scan commands still work by keyword", async () => {
   }
 });
 
-test("saving a file with findings offers a rescan", async () => {
+test("saving a file with findings lights up the Rescan button, without chat messages", async () => {
   posted = [];
   const uri = vscode.Uri.file(path.join(root(), "app.js"));
   controller.onSaved(uri);
-  await new Promise((r) => setTimeout(r, 4600));
-  assert.ok(texts().some((t) => t.startsWith("You changed a file with findings (`app.js`)")));
-  assert.equal(last("confirm")!.yes, "Rescan");
-  posted = [];
-  controller.onSaved(uri); // already offered for this file: no second offer until the next scan
-  await new Promise((r) => setTimeout(r, 4600));
-  assert.ok(!texts().some((t) => t.startsWith("You changed")));
+  controller.onSaved(uri); // the same file counts once
+  controller.onSaved(vscode.Uri.file(path.join(root(), "no-findings.txt")));
+  assert.equal(last("state")!.changed, 1);
+  assert.equal(texts().length, 0);
+  assert.ok(!last("confirm"));
 });
 
 test("chat goes to the chat tool and comes back as Markdown text", async () => {
@@ -162,6 +161,57 @@ test("chat goes to the chat tool and comes back as Markdown text", async () => {
   await controller.send("what is the worst finding?");
   assert.ok(texts().some((t) => t.startsWith("You said: **what is the worst finding?**")));
   assert.ok(posted.some((m) => m.type === "thinking" && m.on));
+});
+
+const waitFor = async (what: string, ok: () => boolean) => {
+  for (let i = 0; i < 100 && !ok(); i++) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(ok(), what);
+};
+const confirmWith = (yes: string) => posted.filter((m) => m.type === "confirm" && m.yes === yes).pop() as
+  Extract<ToWebview, { type: "confirm" }> | undefined;
+
+test("fix: the change is shown first, written only on Apply, and never to a changed file", async () => {
+  const app = path.join(root(), "app.js");
+  const util = path.join(root(), "lib", "util.js");
+  const utilBefore = await fs.readFile(util, "utf8");
+  posted = [];
+  await controller.handle({ type: "fix", ids: ["f1"] });
+  await waitFor("util.js diff is offered", () => texts().some((t) => t.startsWith("Proposed fix for `lib/util.js`")));
+  // The live transcript: a block, the agent's events streamed into it (no heartbeats), then its end.
+  const live = posted.filter((m) => m.type.startsWith("agent")) as any[];
+  assert.equal(live[0].type, "agentStart");
+  assert.deepEqual(live.filter((m) => m.type === "agentEvent").map((m) => m.event.kind),
+                   ["start", "thinking", "thinking", "tool", "result", "text", "done"]);
+  assert.match(live[live.length - 1].title, /^Fix agent finished in \d+ s$/);
+  assert.ok(vscode.window.tabGroups.activeTabGroup.activeTab?.label.includes("proposed fix"), "the diff is open");
+  await controller.handle({ type: "confirm", id: confirmWith("Apply fix")!.id, accept: false });
+  assert.equal(await fs.readFile(util, "utf8"), utilBefore, "Skip leaves the file alone");
+
+  // Several files: review one by one, in path order
+  posted = [];
+  await controller.send("fix all of them"); // the agent returns a fix action for both findings
+  assert.ok(texts().some((t) => t.startsWith("**Fix agent:** 2 fixed and confirmed by the scanners.")));
+  const choice = confirmWith("Apply all (2 files)");
+  assert.ok(choice, "apply all or review");
+  await controller.handle({ type: "confirm", id: choice!.id, accept: false });
+  await waitFor("app.js diff is offered", () => texts().some((t) => t.startsWith("Proposed fix for `app.js` (file 1 of 2)")));
+  assert.equal(await fs.readFile(app, "utf8"), "const a = 2;\nconst q = 'x';\ndb.query(q);\n", "nothing written yet");
+  await controller.handle({ type: "confirm", id: confirmWith("Apply fix")!.id, accept: true });
+  assert.equal(await fs.readFile(app, "utf8"), "const a = 2;\n// fixed\n");
+  await waitFor("util.js is next", () => texts().some((t) => t.startsWith("Proposed fix for `lib/util.js` (file 2 of 2)")));
+  await controller.handle({ type: "confirm", id: confirmWith("Apply fix")!.id, accept: false });
+  assert.ok(texts().includes("Skipped `lib/util.js`."));
+  assert.equal(await fs.readFile(util, "utf8"), utilBefore);
+
+  // Apply all: app.js changed since the upload, so only util.js is written
+  posted = [];
+  await controller.send("fix all of them");
+  await controller.handle({ type: "confirm", id: confirmWith("Apply all (2 files)")!.id, accept: true });
+  assert.ok(texts().some((t) => t.startsWith("Applied changes to 1 of 2 files.")
+    && /`app.js` changed since it was last uploaded/.test(t)));
+  assert.ok((await fs.readFile(util, "utf8")).startsWith("// fixed"));
+  assert.equal(await fs.readFile(app, "utf8"), "const a = 2;\n// fixed\n");
+  await vscode.commands.executeCommand("workbench.action.closeAllEditors");
 });
 
 test("sessions: new, rename, switch back with history, remembered after a restart", async () => {
@@ -229,7 +279,8 @@ test("a token pasted into the settings moves to secret storage", async () => {
   await controller.connect();
   assert.equal(await context.secrets.get("vulnScanner.token"), fake.token);
   assert.equal(vscode.workspace.getConfiguration("vulnScanner").inspect("token")?.workspaceValue, undefined);
-  assert.equal(latestState?.connection.state, "connected");
+  // Changing the setting also starts a reconnect of its own; wait for whichever finishes last.
+  await waitFor("connected", () => latestState?.connection.state === "connected");
 });
 
 test("the token never reaches settings, logs or the webview", async () => {
@@ -255,6 +306,8 @@ process.on("uncaughtException", (e) => note(`uncaughtException: ${e.stack}`));
 process.on("unhandledRejection", (e: any) => note(`unhandledRejection: ${e?.stack ?? e}`));
 process.on("exit", (c) => note(`exit ${c}`));
 
+const TEST_TIMEOUT_MS = 60_000;
+
 export async function run() {
   fake = new FakeHarness({ stepMs: 30, findings: [
     { path: "app.js", start_line: 2, end_line: 3, severity: "high", title: "SQL injection",
@@ -267,7 +320,11 @@ export async function run() {
     for (const [name, fn] of tests) {
       try {
         console.log(`  ...   ${name}`);
-        await fn();
+        // A hung test fails instead of keeping the test window open forever.
+        let timer: NodeJS.Timeout | undefined;
+        await Promise.race([fn(), new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`timed out after ${TEST_TIMEOUT_MS / 1000} s`)), TEST_TIMEOUT_MS);
+        })]).finally(() => clearTimeout(timer));
         console.log(`  ok    ${name}`);
         note(`ok ${name}`);
       } catch (e) {

@@ -90,14 +90,53 @@ export interface FindingsPage {
 /** What the agent decided the user wants; the extension carries it out (only it can upload files). */
 export interface ChatAction {
   /** scan: the current session's target; scan_workspace: the local workspace (from a GitHub session);
-   * scan_github: the repo in `url`; cancel: stop the running scan. */
-  type: "scan" | "scan_workspace" | "scan_github" | "cancel";
+   * scan_github: the repo in `url`; cancel: stop the running scan; fix: fix `finding_ids` with fix_findings. */
+  type: "scan" | "scan_workspace" | "scan_github" | "cancel" | "fix";
   full: boolean;
   /** Folders or files to limit the scan to; empty for everything. */
   paths: string[];
   url: string | null;
   /** Ask the user first: the agent only thinks this is wanted. */
   confirm: boolean;
+  /** For fix: the findings to fix, most serious first. */
+  finding_ids: string[];
+}
+
+/** Replace lines start_line..end_line (1-based, inclusive) with `replacement` ("" deletes them). */
+export interface FixEdit {
+  start_line: number;
+  end_line: number;
+  replacement: string;
+}
+
+/** The fix agent's changes to one file. They apply only to the file whose hash is `file_sha256`. */
+export interface FileFix {
+  path: string;
+  file_sha256: string;
+  edits: FixEdit[];
+}
+
+/** fixed: the scanners no longer report it; still_reported: they still do; not_verified: changed, but
+ * SonarQube cannot recheck one file; not_fixed: its file was not changed (`note` says why). */
+export interface FixOutcome {
+  finding_id: string;
+  status: "fixed" | "still_reported" | "not_verified" | "not_fixed";
+  note: string;
+}
+
+/** One progress event of fix_findings (its progress `message` is this, as JSON). Text and thinking
+ * stream in pieces to append; heartbeat events only keep the request alive. */
+export interface AgentEvent {
+  file: string | null;
+  kind: "start" | "thinking" | "text" | "tool" | "result" | "status" | "done" | "heartbeat";
+  text: string;
+}
+
+/** What fix_findings returns. */
+export interface FixResult {
+  files: FileFix[];
+  summary: string;
+  results: FixOutcome[];
 }
 
 export interface ChatReply {

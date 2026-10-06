@@ -24,6 +24,9 @@ MAX_NAME = 200
 MAX_CHAT_CHARS = 8000
 MAX_MANIFEST_ENTRIES = 200_000
 MAX_FINDINGS_PAGE = 1000
+MAX_FIX_BATCH = 200
+ASK_BEFORE_FIXING_OVER = 10  # bigger batches take minutes of LLM time, so the user confirms first
+SECONDS_PER_FILE = 40  # rough time for the agent to fix one file, several files run at once
 
 
 class UserError(Exception):
@@ -357,10 +360,16 @@ class Service:
         try:
             decision = await intent.decide(self.llm, message, row, files, scan_id is not None,
                                            self.scans.is_running(sid), history)
-            if decision["action"] == "none":
+            if decision["action"] in ("none", "summary"):
                 ws = chat_mod.Workspace(self.code_dir(sid), findings)
-                reply, ids = await chat_mod.chat(self.llm, ws, message, history, self.cfg.llm_tool_calling)
+                if decision["action"] == "summary":
+                    reply, ids = await chat_mod.summarize(self.llm, ws)
+                else:
+                    reply, ids = await chat_mod.chat(self.llm, ws, message, history, self.cfg.llm_tool_calling)
                 action = None
+            elif decision["action"] == "fix":
+                reply, action = self._fix_reply(row, message, findings)
+                ids = action["finding_ids"] if action else []
             else:
                 reply, action = self._action_reply(row, decision, files)
                 ids = []
@@ -379,7 +388,7 @@ class Service:
         if d["action"] == "cancel":
             if not running:
                 return "No scan is running right now.", None
-            return "Stopping the scan.", {"type": "cancel", "full": False, "paths": [], "url": None, "confirm": False}
+            return "Stopping the scan.", _action("cancel")
         if running:
             return "A scan is already running. I'll show the results when it finishes, or say \"stop\" to cancel it.", None
 
@@ -392,7 +401,7 @@ class Service:
                         "Which repository should I scan?"), None
             url = f"https://github.com/{owner}/{repo}"
             text = f"Do you want me to scan {url}?" if not d["sure"] else f"Scanning {url}."
-            return text, {"type": "scan_github", "full": False, "paths": [], "url": url, "confirm": not d["sure"]}
+            return text, _action("scan_github", url=url, confirm=not d["sure"])
 
         # "scan" = this session's target; "scan_workspace" = the local workspace while in a GitHub session.
         kind = "scan_workspace" if d["action"] == "scan_workspace" and row["target_type"] == "github" else "scan"
@@ -414,4 +423,120 @@ class Service:
             what = "the workspace"
         how = " from scratch" if d["full"] else ""
         text = f"Do you want me to scan {what}{how}?" if not d["sure"] else f"Starting a scan of {what}{how}."
-        return text, {"type": kind, "full": d["full"], "paths": paths, "url": None, "confirm": not d["sure"]}
+        return text, _action(kind, full=d["full"], paths=paths, confirm=not d["sure"])
+
+    def _fix_reply(self, row, message, findings):
+        """Pick the findings a fix request means. The extension then runs fix_findings on them
+        and shows the edits before changing any file."""
+        if row["target_type"] != "workspace":
+            return ("I can only fix files in your local workspace, so auto-fix does not work for a GitHub session. "
+                    "Open the project in VS Code and ask me to scan it there."), None
+        if self.scans.is_running(row["id"]):
+            return "A scan is running. Ask me again when it has finished.", None
+        if not findings:
+            return "There are no findings to fix. Ask me to scan the project first.", None
+        targets = fix_targets(message, findings)
+        if not targets and re.search(r"(?i)\b(it|this|that|those|these|them)\b", message):
+            # "fix it": the findings the last reply talked about
+            last = self.db.one("SELECT finding_ids FROM messages WHERE session_id=? AND role='assistant' "
+                               "ORDER BY id DESC LIMIT 1", (row["id"],))
+            by_id = {f["id"]: f for f in findings}
+            targets = [by_id[i] for i in json.loads(last["finding_ids"] or "[]") if i in by_id] if last else []
+        if not targets:
+            return ("Which findings should I fix? Name a finding id, a severity (\"fix all high findings\"), "
+                    "or a file (\"fix src/db.py\"), or click **Fix** on a finding."), None
+        chosen = targets[:MAX_FIX_BATCH]
+        more = f" (the first {MAX_FIX_BATCH} of {len(targets)})" if len(targets) > MAX_FIX_BATCH else ""
+        ids = [f["id"] for f in chosen]
+        if len(chosen) == 1:
+            return (f"Preparing a fix for `{chosen[0]['id']}` ({chosen[0]['title']}). "
+                    "You'll see the change before it is applied."), _action("fix", finding_ids=ids)
+        if len(chosen) <= ASK_BEFORE_FIXING_OVER:
+            return (f"Preparing fixes for {len(chosen)} findings. "
+                    "You'll see every change before it is applied."), _action("fix", finding_ids=ids)
+        files = len({f["path"] for f in chosen})
+        minutes = max(1, round(files * SECONDS_PER_FILE / max(1, self.cfg.llm_max_parallel) / 60))
+        return (f"Fix {len(chosen)} findings{more} in {files} files? The fix agent takes about {minutes} "
+                f"minute{'s' if minutes > 1 else ''}. When it is done you can apply all changes at once or review "
+                "each file first."), \
+            _action("fix", finding_ids=ids, confirm=True)
+
+    async def summarize_findings(self, user, session_id):
+        """A short summary of the latest scan's findings. Not saved in the chat history."""
+        row = self._session(user, session_id)
+        scan_id = self._latest_scan_id(row["id"])
+        findings = self.db.load_findings(scan_id, with_masks=True) if scan_id else []
+        summary, ids = await chat_mod.summarize(self.llm, chat_mod.Workspace(self.code_dir(row["id"]), findings))
+        return {"summary": summary, "finding_ids": ids}
+
+    async def fix_findings(self, user, session_id, finding_ids, report):
+        """Run the fix agent on findings of the latest scan. Sends progress through `report`
+        (with a heartbeat), and returns line edits per file; nothing is changed on disk."""
+        from harness import agent
+        from harness.llm import LLMError
+        row = self._session(user, session_id)
+        if row["target_type"] != "workspace":
+            raise UserError("auto-fix works only for workspace sessions")
+        if self.scans.is_running(row["id"]):
+            raise UserError("a scan is running; fix findings after it finishes")
+        scan_id = self._latest_scan_id(row["id"])
+        findings = self.db.load_findings(scan_id, with_masks=True) if scan_id else []
+        by_id = {f["id"]: f for f in findings}
+        ids = list(dict.fromkeys(str(i) for i in finding_ids or []))
+        if not ids:
+            raise UserError("no findings given")
+        if len(ids) > MAX_FIX_BATCH:
+            raise UserError(f"at most {MAX_FIX_BATCH} findings at a time")
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            raise UserError(f"finding not found: {missing[0]}")
+
+        last = {"percent": 0}
+
+        async def progress(percent, message):
+            last["percent"] = percent
+            await report(percent, message)
+
+        async def heartbeat():  # keeps the client's timeout from firing; clients ignore this event
+            while True:
+                await asyncio.sleep(10)
+                await report(last["percent"], json.dumps({"file": None, "kind": "heartbeat", "text": ""}))
+
+        beat = asyncio.create_task(heartbeat())
+        try:
+            return await agent.fix_findings(self.llm, self.cfg, self.code_dir(row["id"]),
+                                            [by_id[i] for i in ids], findings, progress)
+        except LLMError as e:
+            raise UserError(str(e)) from e
+        finally:
+            beat.cancel()
+
+
+def _action(type_, full=False, paths=(), url=None, confirm=False, finding_ids=()):
+    return {"type": type_, "full": full, "paths": list(paths), "url": url, "confirm": confirm,
+            "finding_ids": list(finding_ids)}
+
+
+_SEVERITY_WORDS = {"critical": "critical", "crit": "critical", "high": "high", "medium": "medium", "med": "medium",
+                   "low": "low", "info": "info"}
+
+
+def fix_targets(message, findings):
+    """Findings a fix request names: ids, else severities and files (likely false alarms left out).
+    "fix everything" means every finding that is not a likely false alarm. Most serious first."""
+    by_id = {f["id"]: f for f in findings}
+    ids = [i for i in re.findall(r"[0-9a-f]{32}", message) if i in by_id]
+    if ids:
+        return [by_id[i] for i in dict.fromkeys(ids)]
+    low = message.lower()
+    words = set(re.findall(r"[a-z]+", low))
+    sevs = {_SEVERITY_WORDS[w] for w in words if w in _SEVERITY_WORDS}
+    tokens = set(re.findall(r"[\w./-]+", message))
+    paths = {f["path"] for f in findings
+             if f["path"] in tokens or (len(f["path"].rsplit("/", 1)[-1]) > 3 and f["path"].rsplit("/", 1)[-1] in tokens)}
+    if not sevs and not paths and not words & {"all", "every", "everything"}:
+        return []
+    out = [f for f in findings if f["verdict"] != "likely_false_positive"
+           and (not sevs or f["severity"] in sevs) and (not paths or f["path"] in paths)]
+    return sorted(out, key=lambda f: (SEVERITIES.index(f["severity"]), f["verdict"] != "likely_real",
+                                      f["path"], f["start_line"]))

@@ -146,6 +146,8 @@ All tools return JSON objects. On error, the tool returns an MCP error result wi
 | `cancel_scan` | `scan_id` | `ok` |
 | `get_findings` | `session_id`, `scan_id` (optional, default latest), `severity` (optional list), `tool` (optional list), `path` (optional), `limit` (default 200), `offset` (default 0) | `findings`, `total` |
 | `chat` | `session_id`, `message` | `reply` (Markdown text), `finding_ids` (findings the reply talks about), `action` (a chat action, or null) |
+| `summarize_findings` | `session_id` | `summary` (short Markdown about the latest finished scan: counts, the most affected files, and up to three things to fix first), `finding_ids`. Not saved in the chat history; the extension shows it after each scan. |
+| `fix_findings` | `session_id`, `finding_ids` (from the latest finished scan, at most 200) | Runs the fix agent. Streams its work as progress notifications (see "Fix agent events"). Returns a fix result (see below). Nothing is changed on either side. |
 
 Rules:
 
@@ -154,18 +156,45 @@ Rules:
 - Only one scan runs per session at a time. A second `start_scan` while one is running returns an error.
 - Each `chat` call is saved to the session's history, both the user message and the reply.
 - `get_findings` with the `scan_id` of a running scan returns the findings found so far. A finding whose `explanation` is empty has not been reviewed by the LLM yet.
+- `fix_findings` works only for `workspace` sessions, and not while a scan runs.
 
 ### Chat action
 
-The agent decides what each chat message asks for. When it wants a scan started or stopped, the `chat` reply carries an action. The extension carries it out, because only the extension can upload workspace files.
+The agent decides what each chat message asks for. When it wants a scan started or stopped, or findings fixed, the `chat` reply carries an action. The extension carries it out, because only the extension can upload or change workspace files. A request for a summary of all findings needs no action: the reply is the summary.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `type` | string | `scan` (the session's own target: the workspace, or the GitHub repo), `scan_workspace` (the local workspace, asked from a GitHub session), `scan_github` (the repo in `url`), or `cancel` (stop the running scan) |
+| `type` | string | `scan` (the session's own target: the workspace, or the GitHub repo), `scan_workspace` (the local workspace, asked from a GitHub session), `scan_github` (the repo in `url`), `cancel` (stop the running scan), or `fix` (call `fix_findings` with `finding_ids`) |
 | `full` | boolean | Scan everything again, not only changed files |
 | `paths` | list of strings | Folders or files to limit the scan to; empty means everything |
 | `url` | string or null | For `scan_github`: `https://github.com/<owner>/<repo>` |
 | `confirm` | boolean | The agent is not sure: ask the user (Yes/No) before acting |
+| `finding_ids` | list of strings | For `fix`: the findings to fix, most serious first (at most 200; more than 10 come with `confirm` set); empty otherwise |
+
+### Fix agent events
+
+The `message` of each `fix_findings` progress notification is a JSON object `{"file", "kind", "text"}`, so the extension can show a live transcript. `file` is the file an agent works on, or null for the whole request. Several files are worked on at once, so events of different files interleave.
+
+| `kind` | `text` |
+| --- | --- |
+| `start` | An agent starts on `file`, for example "3 findings" |
+| `thinking` | A piece of the model's reasoning, streamed; append it to the previous `thinking` text |
+| `text` | A piece of the model's reply, streamed; append it to the previous `text` |
+| `tool` | One line per tool call, for example "Read db.py" or "Edit db.py" |
+| `result` | One short line about the last tool's result, for example "+2 −1 lines" |
+| `status` | A line about the request, for example "Checking all changes with the scanners" |
+| `done` | The agent for `file` finished, for example "Finished 2 of 5 files" |
+| `heartbeat` | Nothing to show; sent at least every 10 seconds to keep the request alive |
+
+### Fix result
+
+What `fix_findings` returns. A coding agent on the harness reads and searches the code, edits files (any file, not only the finding's), and reruns the scanners on its changes. It works on a copy of the uploaded code. The extension shows the changes as diffs and changes a file only after the user accepts, and only if the file's current hash equals `file_sha256`.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `files` | list | One entry per changed file: `path`, `file_sha256` (hash of the file the edits were made for), and `edits`. Each edit has `start_line`, `end_line` (1-based, inclusive) and `replacement` (the new text for those whole lines, without a final newline; empty deletes them). Edits are sorted and never overlap. |
+| `summary` | string | Markdown: what the agent changed and why |
+| `results` | list | One entry per requested finding: `finding_id`, `status`, and `note` (one plain sentence). `status` is `fixed` (the scanners no longer report it), `still_reported`, `not_verified` (changed, but SonarQube cannot recheck one file), or `not_fixed` (its file was not changed; `note` says why). |
 
 ### Scan summary
 

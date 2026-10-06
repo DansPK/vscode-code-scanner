@@ -221,9 +221,36 @@ export class FakeHarness {
         const lim = a.limit ?? 200;
         return { findings: all.slice(off, off + lim), total: all.length };
       }
+      case "summarize_findings": {
+        const s = this.session(a.session_id);
+        const all = this.latestScan(s.id, true) ? this.findingsFor(s) : [];
+        return { summary: `**${all.length} findings.** Fix the SQL injection first.`, finding_ids: all.slice(0, 1).map((f) => f.id) };
+      }
+      case "fix_findings": {
+        const s = this.session(a.session_id);
+        if (s.target_type !== "workspace") throw new Error("auto-fix works only for workspace sessions");
+        const all = this.latestScan(s.id, true) ? this.findingsFor(s) : [];
+        const chosen = (a.finding_ids as string[]).map((id) => all.find((x) => x.id === id));
+        if (!chosen.length || chosen.some((f) => !f)) throw new Error("finding not found");
+        if (progressToken !== undefined) {
+          const file = chosen[0]!.path;
+          for (const [kind, text] of [["start", "1 finding"], ["thinking", "Look at the "], ["thinking", "query first."],
+                                      ["tool", `Edit ${file}`], ["result", "+1 −1 lines"], ["heartbeat", ""],
+                                      ["text", "Done."], ["done", "Finished 1 of 1 files"]]) {
+            await extra.sendNotification({ method: "notifications/progress",
+              params: { progressToken, progress: 50, total: 100, message: JSON.stringify({ file, kind, text }) } });
+          }
+        }
+        return {
+          files: chosen.map((f) => ({ path: f!.path, file_sha256: f!.file_sha256,
+                                      edits: [{ start_line: f!.start_line, end_line: f!.end_line, replacement: "// fixed" }] })),
+          summary: "- Replaced the unsafe code.",
+          results: chosen.map((f) => ({ finding_id: f!.id, status: "fixed", note: "The scanners no longer report it." })),
+        };
+      }
       case "chat": {
         const s = this.session(a.session_id);
-        if (this.llmDown) throw new Error("The LLM cannot be reached at http://llm.invalid");
+        if (this.llmDown) throw new Error("The LLM cannot be reached. Check LLM_BASE_URL on the scanner server.");
         const { reply, action } = this.agent(s, a.message);
         s.messages.push({ role: "user", text: a.message, finding_ids: [] },
                         { role: "assistant", text: reply, finding_ids: [] });
@@ -243,11 +270,14 @@ export class FakeHarness {
 
   /** A stand-in for the harness's agent: decides with simple rules what the message wants. */
   private agent(s: Session, text: string): { reply: string; action: ChatAction | null } {
-    const base = { full: false, paths: [] as string[], url: null as string | null, confirm: false };
+    const base = { full: false, paths: [] as string[], url: null as string | null, confirm: false, finding_ids: [] as string[] };
     const running = [...this.scans.values()].some((x) => x.session_id === s.id && x.status === "running");
     if (/^\s*(stop|cancel)\b/i.test(text)) {
       return running ? { reply: "Stopping the scan.", action: { ...base, type: "cancel" } }
         : { reply: "No scan is running right now.", action: null };
+    }
+    if (/^\s*fix\b/i.test(text)) {
+      return { reply: "Preparing fixes.", action: { ...base, type: "fix", finding_ids: this.findingsFor(s).map((f) => f.id) } };
     }
     const r = route(text);
     if (r.kind === "github") return { reply: `Scanning ${r.url}.`, action: { ...base, type: "scan_github", url: r.url } };
@@ -349,7 +379,7 @@ export class FakeHarness {
 }
 
 const TOOL_NAMES = ["create_session", "list_sessions", "get_session", "rename_session", "delete_session",
-  "sync_files", "request_upload", "start_scan", "watch_scan", "get_scan_status", "cancel_scan", "get_findings", "chat"];
+  "sync_files", "request_upload", "start_scan", "watch_scan", "get_scan_status", "cancel_scan", "get_findings", "chat", "fix_findings", "summarize_findings"];
 
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {

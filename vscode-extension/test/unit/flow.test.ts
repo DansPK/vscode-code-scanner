@@ -5,6 +5,7 @@ import { after, before, test } from "node:test";
 import { listArchive } from "../../src/archive";
 import { HarnessClient, TOKEN_REJECTED } from "../../src/client";
 import { prepareWorkspace, TooLargeError, watchToEnd } from "../../src/scanFlow";
+import { hashFile } from "../../src/workspaceFiles";
 import { FakeHarness } from "../fakeServer";
 import { makeTree } from "./helpers";
 import * as os from "os";
@@ -129,3 +130,25 @@ function randomText(n: number) {
   while (s.length < n) s += Math.random().toString(36).slice(2);
   return s.slice(0, n);
 }
+
+test("fix_findings returns edits for the uploaded file with progress, and the chat can ask for fixes", async () => {
+  const dir = await makeTree({ "app.js": "const q = 'SELECT ' + input;\n" });
+  const c = new HarnessClient(fake.url, fake.token);
+  const { session_id } = await c.createSession("workspace");
+  await assert.rejects(c.fixFindings(session_id, ["f0"], () => undefined), /finding not found/);
+  const prepared = await prepareWorkspace(c, session_id, dir, settings);
+  const { scan_id } = await c.startScan(session_id, { upload_id: prepared.uploadId });
+  await watchToEnd(c, scan_id, () => undefined);
+  const progress: string[] = [];
+  const r = await c.fixFindings(session_id, ["f0"], (_p, m) => progress.push(m));
+  const p = r.files[0];
+  assert.equal(p.path, "app.js");
+  assert.equal(p.file_sha256, await hashFile(path.join(dir, "app.js")));
+  assert.deepEqual(p.edits, [{ start_line: 1, end_line: 1, replacement: "// fixed" }]);
+  assert.equal(r.results[0].status, "fixed");
+  assert.equal(progress.length, 8);
+  assert.deepEqual(JSON.parse(progress[3]), { file: "app.js", kind: "tool", text: "Edit app.js" });
+  const reply = await c.chat(session_id, "fix all of them");
+  assert.deepEqual(reply.action?.finding_ids, ["f0"]);
+  await c.close();
+});

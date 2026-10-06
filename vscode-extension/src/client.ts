@@ -2,8 +2,9 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { FetchFn, tlsErrorCode } from "./http";
-import type { ChatReply, FindingsPage, ManifestEntry, ScanSummary, SessionDetail, SessionInfo, SyncResult,
+import type { ChatReply, FindingsPage, FixResult, ManifestEntry, ScanSummary, SessionDetail, SessionInfo, SyncResult,
   UploadTicket } from "./shared/contract";
 
 export const TOKEN_REJECTED = "Token rejected. Run Vuln Scanner: Set Token.";
@@ -75,15 +76,31 @@ export class HarnessClient {
     long?: boolean; signal?: AbortSignal;
   } = {}): Promise<T> {
     if (!this.client) await this.connect();
+    const send = () => this.client!.callTool({ name, arguments: args }, undefined, {
+      onprogress: opts.onprogress, signal: opts.signal,
+      timeout: opts.long ? WATCH_IDLE_TIMEOUT_MS : CALL_TIMEOUT_MS,
+      resetTimeoutOnProgress: opts.long,
+      maxTotalTimeout: opts.long ? WATCH_TOTAL_TIMEOUT_MS : undefined,
+    });
     let result;
     try {
-      result = await this.client!.callTool({ name, arguments: args }, undefined, {
-        onprogress: opts.onprogress, signal: opts.signal,
-        timeout: opts.long ? WATCH_IDLE_TIMEOUT_MS : CALL_TIMEOUT_MS,
-        resetTimeoutOnProgress: opts.long,
-        maxTotalTimeout: opts.long ? WATCH_TOTAL_TIMEOUT_MS : undefined,
-      });
+      try {
+        result = await send();
+      } catch (e) {
+        // The harness restarted and forgot our MCP session. It refused the call without running it,
+        // so connecting again and sending it once more is safe.
+        if (!(e instanceof StreamableHTTPError && e.code === 404)) throw e;
+        await this.close();
+        await this.connect();
+        result = await send();
+      }
     } catch (e) {
+      if (e instanceof McpError && e.code === ErrorCode.RequestTimeout) {
+        // No answer: the connection may be dead (for example the harness restarted mid-call). The call may
+        // have run, so it is not repeated; the next call connects again.
+        await this.close();
+        throw new Error("The scanner server did not answer in time. It may have restarted; try again.");
+      }
       const mapped = mapError(e, this.serverUrl);
       if (mapped instanceof ServerUnreachableError || mapped instanceof TokenRejectedError) await this.close();
       throw mapped;
@@ -140,5 +157,14 @@ export class HarnessClient {
   }
   chat(session_id: string, message: string) {
     return this.call<ChatReply>("chat", { session_id, message });
+  }
+  summarizeFindings(session_id: string) {
+    return this.call<{ summary: string; finding_ids: string[] }>("summarize_findings", { session_id });
+  }
+  fixFindings(session_id: string, finding_ids: string[], onProgress: (percent: number, message: string) => void,
+              signal?: AbortSignal) {
+    return this.call<FixResult>("fix_findings", { session_id, finding_ids }, {
+      long: true, signal, onprogress: (p) => onProgress(Math.round(p.progress), p.message ?? ""),
+    });
   }
 }

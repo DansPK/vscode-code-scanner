@@ -200,3 +200,86 @@ async def chat(llm, workspace, message, history, tool_calling):
     text = (reply.get("content") or "").strip() or "Sorry, I could not come up with an answer."
     ids = list(dict.fromkeys(_mentioned_ids(text, workspace) + looked_at))
     return text, ids
+
+
+SUMMARY_FINDINGS_FOR_LLM = 60
+SUMMARY_BULLETS = 3
+SUMMARY_SYSTEM = """You summarise a code security scan in a few words. You get the findings, most serious first.
+Reply in exactly this form and nothing else:
+Overall: <one sentence: how risky the project looks and why>
+- <the most important thing to fix first: the problem, the file, and one finding id in backticks>
+- <the second>
+- <the third>
+At most three bullets, each under 20 words, each with at most one finding id. Group findings that share one fix.
+Use only the findings given: never invent findings, numbers or scores."""
+
+
+def _concise(text):
+    """Keep the one-sentence overall and at most three bullets, whatever else the model wrote."""
+    overall, bullets = None, []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        m = re.match(r"[*_#\s]*overall[*_]*\s*:?[*_]*\s*(.+)", line, re.I)
+        if m and overall is None:
+            overall = _first_sentence(m.group(1).strip("*_ "))
+            continue
+        m = re.match(r"(?:[-*•]|\d+[.)])\s+(.+)", line)
+        if m and len(bullets) < SUMMARY_BULLETS:
+            bullets.append(m.group(1).strip())
+    if overall is None and not bullets:
+        return _first_sentence(text)
+    parts = [overall] if overall else []
+    if bullets:
+        parts.append("**Fix first:**\n" + "\n".join(f"{i}. {b}" for i, b in enumerate(bullets, 1)))
+    return "\n\n".join(parts)
+
+
+def _first_sentence(text):
+    m = re.match(r"(.+?[.!?])(\s|$)", (text or "").strip(), re.DOTALL)
+    return (m.group(1) if m else (text or "")).replace("\n", " ").strip()[:200]
+
+
+def summary_stats(findings):
+    """The facts part of the summary, two lines. Needs no LLM."""
+    if not findings:
+        return "**No findings.**"
+    sev = Counter(f["severity"] for f in findings)
+    real = sum(f["verdict"] == "likely_real" for f in findings)
+    fp = sum(f["verdict"] == "likely_false_positive" for f in findings)
+    counts = " · ".join(f"{sev[s]} {s}" for s in SEVERITIES if sev[s])
+    n = len(findings)
+    line = f"**{n} finding{'s' if n != 1 else ''}** ({counts}). "
+    looks = lambda k: "looks" if k == 1 else "look"
+    if fp == n:
+        line += "It looks like a false alarm." if n == 1 else "All look like false alarms."
+    else:
+        line += f"{real} {looks(real)} real" + (f", {fp} {looks(fp)} like false alarms." if fp else ".")
+    worth = [f for f in findings if f["verdict"] != "likely_false_positive"]
+    if worth:
+        top = Counter(f["path"] for f in worth).most_common(3)
+        line += "\nMost affected: " + ", ".join(f"`{p}` ({n})" for p, n in top) + "."
+    return line
+
+
+async def summarize(llm, workspace):
+    """Return (markdown, finding_ids): two lines of counts, then one sentence and up to three
+    things to fix first from the LLM. Without findings worth fixing, the counts are enough."""
+    stats = summary_stats(workspace.findings)
+    findings = [f for f in workspace.findings if f["verdict"] != "likely_false_positive"]
+    if not findings:
+        return stats, []
+    top = sorted(findings, key=lambda f: (SEVERITIES.index(f["severity"]), f["verdict"] != "likely_real", f["path"]))
+    listing = "\n".join(f"- `{f['id']}` {f['severity']} {f['title']} in {f['path']}:{f['start_line']}"
+                        f" ({f['verdict']}). {_first_sentence(f.get('explanation') or f['message'])}"
+                        for f in top[:SUMMARY_FINDINGS_FOR_LLM])
+    more = len(top) - SUMMARY_FINDINGS_FOR_LLM
+    prompt = listing + (f"\n...and {more} less serious ones." if more > 0 else "")
+    try:
+        reply = await llm.complete([{"role": "system", "content": SUMMARY_SYSTEM}, {"role": "user", "content": prompt}])
+        text = _concise(reply.get("content") or "")
+    except LLMError as e:
+        log.warning("summary assessment failed: %s", e)
+        text = ""
+    if not text:
+        return stats, []
+    return stats + "\n\n" + text, _mentioned_ids(text, workspace)

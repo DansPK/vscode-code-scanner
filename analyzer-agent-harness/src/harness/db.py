@@ -33,10 +33,13 @@ CREATE TABLE IF NOT EXISTS findings (
     path TEXT NOT NULL, tools TEXT NOT NULL, data TEXT NOT NULL, masks TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (scan_id, id));
 CREATE INDEX IF NOT EXISTS findings_session ON findings(session_id);
-CREATE TABLE IF NOT EXISTS llm_reviews (
-    finding_id TEXT NOT NULL, file_sha256 TEXT NOT NULL, verdict TEXT NOT NULL,
+-- Reviews are cached per model too, so switching LLM_MODEL reviews findings again.
+-- llm_reviews was the cache before the model was part of the key.
+DROP TABLE IF EXISTS llm_reviews;
+CREATE TABLE IF NOT EXISTS review_cache (
+    finding_id TEXT NOT NULL, file_sha256 TEXT NOT NULL, model TEXT NOT NULL, verdict TEXT NOT NULL,
     explanation TEXT NOT NULL, fix_recommendation TEXT NOT NULL, suggested_patch TEXT,
-    PRIMARY KEY (finding_id, file_sha256));
+    PRIMARY KEY (finding_id, file_sha256, model));
 """
 
 
@@ -80,13 +83,13 @@ class DB:
 
     # --- review cache ---
 
-    def get_review(self, finding_id, file_sha256):
-        return self.one("SELECT verdict, explanation, fix_recommendation, suggested_patch FROM llm_reviews "
-                        "WHERE finding_id=? AND file_sha256=?", (finding_id, file_sha256))
+    def get_review(self, finding_id, file_sha256, model):
+        return self.one("SELECT verdict, explanation, fix_recommendation, suggested_patch FROM review_cache "
+                        "WHERE finding_id=? AND file_sha256=? AND model=?", (finding_id, file_sha256, model))
 
-    def put_review(self, finding_id, file_sha256, review):
-        self.run("INSERT OR REPLACE INTO llm_reviews VALUES (?,?,?,?,?,?)",
-                 (finding_id, file_sha256, review["verdict"], review["explanation"],
+    def put_review(self, finding_id, file_sha256, model, review):
+        self.run("INSERT OR REPLACE INTO review_cache VALUES (?,?,?,?,?,?,?)",
+                 (finding_id, file_sha256, model, review["verdict"], review["explanation"],
                   review["fix_recommendation"], review.get("suggested_patch")))
 
     # --- findings ---
