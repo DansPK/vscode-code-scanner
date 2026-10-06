@@ -10,7 +10,7 @@ How to run the scanner harness in Docker, connect an LLM and SonarQube, and inst
 ./setup.sh                                  # does everything else
 ```
 
-The script generates the signing secret and picks free ports, writing an override file if 8080 or 9000 are taken. It starts SonarQube and creates its token, builds and starts the harness, and checks the LLM. It then creates your user token, and builds and installs the extension with the server URL and token set in VS Code. It is safe to run again: it keeps a valid SonarQube token and an existing user token.
+The script generates the signing secret and the SearXNG secret (for the agents' web search), picks free ports, writing an override file if 8080 or 9000 are taken. It starts SonarQube and creates its token, builds and starts the harness, and checks the LLM. It then creates your user token, and builds and installs the extension with the server URL and token set in VS Code. It is safe to run again: it keeps a valid SonarQube token and an existing user token.
 
 Options: `HARNESS_USER=alice` (default: your login name), `NEW_TOKEN=1` (replace your token), `SONAR_ADMIN_PASSWORD=...` (if you changed SonarQube's admin password). On Linux it may ask for `sudo` to raise `vm.max_map_count`.
 

@@ -166,6 +166,10 @@ export class FakeHarness {
         if ([...this.scans.values()].some((x) => x.session_id === s.id && (x.status === "running" || x.status === "queued"))) {
           throw new Error("a scan is already running for this session");
         }
+        if (s.target_type === "github" && /private/.test(s.repo_url ?? "") && !a.github_token) {
+          const repo = s.repo_url!.split("github.com/")[1];
+          throw new Error(`Could not get ${repo} from GitHub (git clone failed). If the repository is private, sign in to GitHub and scan again.`);
+        }
         if (s.target_type === "workspace") {
           if (s.pending) {
             for (const e of s.pending) s.manifest.set(e.path, e);
@@ -224,7 +228,15 @@ export class FakeHarness {
       case "summarize_findings": {
         const s = this.session(a.session_id);
         const all = this.latestScan(s.id, true) ? this.findingsFor(s) : [];
-        return { summary: `**${all.length} findings.** Fix the SQL injection first.`, finding_ids: all.slice(0, 1).map((f) => f.id) };
+        const counts: Record<string, number> = {};
+        for (const f of all) counts[f.severity] = (counts[f.severity] ?? 0) + 1;
+        const real = all.filter((f) => f.verdict === "likely_real");
+        return {
+          summary: `**${all.length} findings.** Fix the SQL injection first.`, finding_ids: real.slice(0, 1).map((f) => f.id),
+          card: { total: all.length, counts, likely_real: real.length, false_alarms: all.length - real.length,
+                  files: real.slice(0, 1).map((f) => ({ path: f.path, count: 1 })), overall: "One real problem.",
+                  fix_first: real.slice(0, 1).map((f) => ({ text: "Use a parameterised query in app.js", finding_ids: [f.id] })) },
+        };
       }
       case "fix_findings": {
         const s = this.session(a.session_id);

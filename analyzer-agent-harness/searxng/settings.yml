@@ -1,0 +1,11 @@
+# SearXNG for the harness's web_search tool. Only reachable inside the compose network.
+use_default_settings: true
+server:
+  secret_key: "overridden-by-SEARXNG_SECRET"   # the SEARXNG_SECRET environment variable wins
+  limiter: false          # only the harness talks to it
+  image_proxy: false
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json                # the harness reads results as JSON

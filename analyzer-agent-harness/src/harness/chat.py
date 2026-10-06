@@ -6,7 +6,7 @@ import re
 from collections import Counter
 from pathlib import Path
 
-from harness import files
+from harness import files, web
 from harness.llm import LLMError, LLMUnreachable
 from harness.scanners.findings import SEVERITIES, mask_lines, read_lines
 
@@ -154,9 +154,10 @@ def _without_tool_turns(messages):
     return out
 
 
-async def chat(llm, workspace, message, history, tool_calling):
-    """Return (reply_markdown, finding_ids)."""
-    system = SYSTEM + "\n\n" + workspace.summary()
+async def chat(llm, workspace, message, history, tool_calling, web_url=None):
+    """Return (reply_markdown, finding_ids). With `web_url` (SearXNG), the agent can also search the web."""
+    web_url = web_url if tool_calling else None
+    system = SYSTEM + ("\n" + web.PROMPT if web_url else "") + "\n\n" + workspace.summary()
     if not tool_calling:
         system += _named_files_text(llm, workspace, message)
     messages = [{"role": "system", "content": system}]
@@ -164,7 +165,7 @@ async def chat(llm, workspace, message, history, tool_calling):
     messages.append({"role": "user", "content": message})
 
     looked_at = []
-    tools = TOOLS if tool_calling else None
+    tools = (TOOLS + web.TOOLS if web_url else TOOLS) if tool_calling else None
     for _ in range(MAX_TOOL_STEPS):
         try:
             reply = await llm.complete(messages, tools)
@@ -189,7 +190,12 @@ async def chat(llm, workspace, message, history, tool_calling):
                 args = json.loads(c["arguments"] or "{}")
             except json.JSONDecodeError:
                 args = None
-            result = workspace.call(c["name"], args) if isinstance(args, dict) else {"error": "arguments are not JSON"}
+            if not isinstance(args, dict):
+                result = {"error": "arguments are not JSON"}
+            elif web_url and c["name"] in web.NAMES:
+                result = await web.call(web_url, c["name"], args)
+            else:
+                result = workspace.call(c["name"], args)
             if c["name"] == "get_finding" and "id" in result:
                 looked_at.append(result["id"])
             messages.append({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(result)[:20000]})
@@ -214,8 +220,8 @@ At most three bullets, each under 20 words, each with at most one finding id. Gr
 Use only the findings given: never invent findings, numbers or scores."""
 
 
-def _concise(text):
-    """Keep the one-sentence overall and at most three bullets, whatever else the model wrote."""
+def _parse_summary(text):
+    """The one-sentence overall and at most three bullets, whatever else the model wrote."""
     overall, bullets = None, []
     for line in (text or "").splitlines():
         line = line.strip()
@@ -226,12 +232,9 @@ def _concise(text):
         m = re.match(r"(?:[-*•]|\d+[.)])\s+(.+)", line)
         if m and len(bullets) < SUMMARY_BULLETS:
             bullets.append(m.group(1).strip())
-    if overall is None and not bullets:
-        return _first_sentence(text)
-    parts = [overall] if overall else []
-    if bullets:
-        parts.append("**Fix first:**\n" + "\n".join(f"{i}. {b}" for i, b in enumerate(bullets, 1)))
-    return "\n\n".join(parts)
+    if overall is None and not bullets and (text or "").strip():
+        overall = _first_sentence(text)
+    return overall, bullets
 
 
 def _first_sentence(text):
@@ -239,47 +242,71 @@ def _first_sentence(text):
     return (m.group(1) if m else (text or "")).replace("\n", " ").strip()[:200]
 
 
-def summary_stats(findings):
-    """The facts part of the summary, two lines. Needs no LLM."""
-    if not findings:
-        return "**No findings.**"
+_ID_IN_TEXT = re.compile(r"\s*[(\[]?`?\b[0-9a-f]{32}\b`?[)\]]?")
+
+
+def summary_card(findings):
+    """The counts part of the summary card. Needs no LLM."""
+    worth = [f for f in findings if f["verdict"] != "likely_false_positive"]
     sev = Counter(f["severity"] for f in findings)
-    real = sum(f["verdict"] == "likely_real" for f in findings)
-    fp = sum(f["verdict"] == "likely_false_positive" for f in findings)
-    counts = " · ".join(f"{sev[s]} {s}" for s in SEVERITIES if sev[s])
-    n = len(findings)
-    line = f"**{n} finding{'s' if n != 1 else ''}** ({counts}). "
+    return {"total": len(findings), "counts": {s: sev[s] for s in SEVERITIES if sev[s]},
+            "likely_real": sum(f["verdict"] == "likely_real" for f in findings),
+            "false_alarms": len(findings) - len(worth),
+            "files": [{"path": p, "count": n} for p, n in Counter(f["path"] for f in worth).most_common(3)],
+            "overall": None, "fix_first": []}
+
+
+def card_markdown(card):
+    """The card as short Markdown, for the chat history and for clients that do not draw cards."""
+    n = card["total"]
+    if not n:
+        return "**No findings.**"
+    counts = " · ".join(f"{c} {s}" for s, c in card["counts"].items())
     looks = lambda k: "looks" if k == 1 else "look"
-    if fp == n:
+    line = f"**{n} finding{'s' if n != 1 else ''}** ({counts}). "
+    if card["false_alarms"] == n:
         line += "It looks like a false alarm." if n == 1 else "All look like false alarms."
     else:
+        real, fp = card["likely_real"], card["false_alarms"]
         line += f"{real} {looks(real)} real" + (f", {fp} {looks(fp)} like false alarms." if fp else ".")
-    worth = [f for f in findings if f["verdict"] != "likely_false_positive"]
-    if worth:
-        top = Counter(f["path"] for f in worth).most_common(3)
-        line += "\nMost affected: " + ", ".join(f"`{p}` ({n})" for p, n in top) + "."
-    return line
+    if card["files"]:
+        line += "\nMost affected: " + ", ".join(f"`{f['path']}` ({f['count']})" for f in card["files"]) + "."
+    parts = [line]
+    if card["overall"]:
+        parts.append(card["overall"])
+    if card["fix_first"]:
+        parts.append("**Fix first:**\n" + "\n".join(
+            f"{i}. {x['text']}" + "".join(f" (`{fid}`)" for fid in x["finding_ids"][:1])
+            for i, x in enumerate(card["fix_first"], 1)))
+    return "\n\n".join(parts)
+
+
+def summary_stats(findings):
+    """The counts part as Markdown."""
+    return card_markdown(summary_card(findings))
 
 
 async def summarize(llm, workspace):
-    """Return (markdown, finding_ids): two lines of counts, then one sentence and up to three
-    things to fix first from the LLM. Without findings worth fixing, the counts are enough."""
-    stats = summary_stats(workspace.findings)
+    """Return (markdown, finding_ids, card): counts, then one sentence and up to three things to
+    fix first from the LLM. Without findings worth fixing, the counts are enough."""
+    card = summary_card(workspace.findings)
     findings = [f for f in workspace.findings if f["verdict"] != "likely_false_positive"]
-    if not findings:
-        return stats, []
-    top = sorted(findings, key=lambda f: (SEVERITIES.index(f["severity"]), f["verdict"] != "likely_real", f["path"]))
-    listing = "\n".join(f"- `{f['id']}` {f['severity']} {f['title']} in {f['path']}:{f['start_line']}"
-                        f" ({f['verdict']}). {_first_sentence(f.get('explanation') or f['message'])}"
-                        for f in top[:SUMMARY_FINDINGS_FOR_LLM])
-    more = len(top) - SUMMARY_FINDINGS_FOR_LLM
-    prompt = listing + (f"\n...and {more} less serious ones." if more > 0 else "")
-    try:
-        reply = await llm.complete([{"role": "system", "content": SUMMARY_SYSTEM}, {"role": "user", "content": prompt}])
-        text = _concise(reply.get("content") or "")
-    except LLMError as e:
-        log.warning("summary assessment failed: %s", e)
-        text = ""
-    if not text:
-        return stats, []
-    return stats + "\n\n" + text, _mentioned_ids(text, workspace)
+    if findings:
+        top = sorted(findings, key=lambda f: (SEVERITIES.index(f["severity"]), f["verdict"] != "likely_real", f["path"]))
+        listing = "\n".join(f"- `{f['id']}` {f['severity']} {f['title']} in {f['path']}:{f['start_line']}"
+                            f" ({f['verdict']}). {_first_sentence(f.get('explanation') or f['message'])}"
+                            for f in top[:SUMMARY_FINDINGS_FOR_LLM])
+        more = len(top) - SUMMARY_FINDINGS_FOR_LLM
+        prompt = listing + (f"\n...and {more} less serious ones." if more > 0 else "")
+        try:
+            reply = await llm.complete([{"role": "system", "content": SUMMARY_SYSTEM}, {"role": "user", "content": prompt}])
+            overall, bullets = _parse_summary(reply.get("content") or "")
+        except LLMError as e:
+            log.warning("summary assessment failed: %s", e)
+            overall, bullets = None, []
+        card["overall"] = overall
+        # Ids go into the item's links, not its text.
+        card["fix_first"] = [{"text": _ID_IN_TEXT.sub("", b).strip(" ,;:-") or b,
+                              "finding_ids": _mentioned_ids(b, workspace)} for b in bullets]
+    ids = list(dict.fromkeys(i for x in card["fix_first"] for i in x["finding_ids"]))
+    return card_markdown(card), ids, card

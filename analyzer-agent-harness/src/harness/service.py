@@ -263,7 +263,8 @@ class Service:
             scope.append(p)
         return scope
 
-    async def start_scan(self, user, session_id, upload_id=None, deleted_paths=None, full=False, paths=None):
+    async def start_scan(self, user, session_id, upload_id=None, deleted_paths=None, full=False, paths=None,
+                         github_token=None):
         row = self._session(user, session_id)
         sid = row["id"]
         if len(paths or []) > 100:
@@ -289,7 +290,7 @@ class Service:
             else:
                 if self.github is None:
                     raise UserError("GitHub scans are not available")
-                files, changed, web_base = await self.github.prepare(row, self.code_dir(sid))
+                files, changed, web_base = await self.github.prepare(row, self.code_dir(sid), github_token)
             if not files:
                 raise UserError("there are no files to scan")
             scope = self._scope(paths, files)
@@ -363,9 +364,10 @@ class Service:
             if decision["action"] in ("none", "summary"):
                 ws = chat_mod.Workspace(self.code_dir(sid), findings)
                 if decision["action"] == "summary":
-                    reply, ids = await chat_mod.summarize(self.llm, ws)
+                    reply, ids, _ = await chat_mod.summarize(self.llm, ws)
                 else:
-                    reply, ids = await chat_mod.chat(self.llm, ws, message, history, self.cfg.llm_tool_calling)
+                    reply, ids = await chat_mod.chat(self.llm, ws, message, history, self.cfg.llm_tool_calling,
+                                                     self.cfg.web_search_url)
                 action = None
             elif decision["action"] == "fix":
                 reply, action = self._fix_reply(row, message, findings)
@@ -397,7 +399,7 @@ class Service:
             try:
                 owner, repo = github.parse_url(d["url"])
             except UserError:
-                return ("I can only scan public GitHub repositories given as https://github.com/owner/repo. "
+                return ("I can scan GitHub repositories given as https://github.com/owner/repo. "
                         "Which repository should I scan?"), None
             url = f"https://github.com/{owner}/{repo}"
             text = f"Do you want me to scan {url}?" if not d["sure"] else f"Scanning {url}."
@@ -466,8 +468,8 @@ class Service:
         row = self._session(user, session_id)
         scan_id = self._latest_scan_id(row["id"])
         findings = self.db.load_findings(scan_id, with_masks=True) if scan_id else []
-        summary, ids = await chat_mod.summarize(self.llm, chat_mod.Workspace(self.code_dir(row["id"]), findings))
-        return {"summary": summary, "finding_ids": ids}
+        summary, ids, card = await chat_mod.summarize(self.llm, chat_mod.Workspace(self.code_dir(row["id"]), findings))
+        return {"summary": summary, "finding_ids": ids, "card": card}
 
     async def fix_findings(self, user, session_id, finding_ids, report):
         """Run the fix agent on findings of the latest scan. Sends progress through `report`

@@ -45,6 +45,7 @@ class Config:
     git_clone_timeout_seconds: int
     tls_cert: Path | None = None
     tls_key: Path | None = None
+    web_search_url: str | None = None  # a SearXNG instance; None turns the agents' web tools off
 
     @property
     def db_path(self):
@@ -97,6 +98,7 @@ def load(env=None):
             git_clone_timeout_seconds=int(env.get("GIT_CLONE_TIMEOUT_SECONDS", "300")),
             tls_cert=tls_cert,
             tls_key=tls_key,
+            web_search_url=env.get("WEB_SEARCH_URL", "").strip().rstrip("/") or None,
         )
     except ValueError as e:
         raise ConfigError(f"Bad number in environment: {e}") from e

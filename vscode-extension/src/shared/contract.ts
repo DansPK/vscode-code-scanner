@@ -124,6 +124,19 @@ export interface FixOutcome {
   note: string;
 }
 
+/** The structured summary of a scan (summarize_findings), drawn as a card. */
+export interface SummaryCard {
+  total: number;
+  counts: Partial<Record<Severity, number>>;
+  likely_real: number;
+  false_alarms: number;
+  /** Up to three files with the most findings worth fixing. */
+  files: { path: string; count: number }[];
+  overall: string | null;
+  /** Up to three things to fix first; `finding_ids` link to the findings (ids are not in `text`). */
+  fix_first: { text: string; finding_ids: string[] }[];
+}
+
 /** One progress event of fix_findings (its progress `message` is this, as JSON). Text and thinking
  * stream in pieces to append; heartbeat events only keep the request alive. */
 export interface AgentEvent {

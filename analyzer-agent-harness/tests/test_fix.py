@@ -102,15 +102,17 @@ def test_summary_stats():
 def test_summary_is_cut_to_one_sentence_and_three_bullets():
     text = ("## Overall: The project is risky. It has SQL injection.\n\n## Top risks\n- a\n- b\n"
             "## Fix first\n1. c\n2. d\nNotes on risk scoring: 0.8")
-    assert chat._concise(text) == "The project is risky.\n\n**Fix first:**\n1. a\n2. b\n3. c"
-    assert chat._concise("Just one sentence. And more.") == "Just one sentence."
+    assert chat._parse_summary(text) == ("The project is risky.", ["a", "b", "c"])
+    assert chat._parse_summary("Just one sentence. And more.") == ("Just one sentence.", [])
 
 
 async def test_summary_skips_the_llm_when_nothing_looks_real(cfg, tmp_path):
     fake = FakeLLMCompletion()
     fs = [{**_f("a", "medium", "x.py", "likely_false_positive"), "tools": ["semgrep"], "cwe": None, "title": "t"}]
-    text, ids = await chat.summarize(LLM(cfg, fake), chat.Workspace(tmp_path, fs))
+    text, ids, card = await chat.summarize(LLM(cfg, fake), chat.Workspace(tmp_path, fs))
     assert text.startswith("**1 finding**") and not fake.calls and ids == []
+    assert card == {"total": 1, "counts": {"medium": 1}, "likely_real": 0, "false_alarms": 1, "files": [],
+                    "overall": None, "fix_first": []}
 
 
 def _scripted(*steps):
@@ -172,6 +174,10 @@ async def test_fix_agent_and_summary_through_mcp(harness_server, tokens, vuln_ap
         before = len((await call(c, "get_session", {"session_id": sid}))["messages"])
         s = await call(c, "summarize_findings", {"session_id": sid})
         assert s["summary"] == r["reply"] and s["finding_ids"] == [sqli["id"]]
+        card = s["card"]
+        assert card["total"] == len(findings) and card["overall"] == "Risky."
+        assert card["fix_first"] == [{"text": "Fix in db.py", "finding_ids": [sqli["id"]]}]  # id moved out of the text
+        assert sum(card["counts"].values()) == len(findings) and card["files"]
         assert len((await call(c, "get_session", {"session_id": sid}))["messages"]) == before  # not in history
 
     async with connect(harness_server.url, tokens["bob"]) as c:  # other users cannot fix alice's findings
@@ -250,3 +256,16 @@ async def test_agent_falls_back_to_one_shot_fixes(cfg, tmp_path):
     events = [json.loads(e) for e in events]
     assert {"file": "db.py", "kind": "text", "text": "I would fix it like this."} in events  # streamed text
     assert any(e["kind"] == "status" and "one-shot" in e["text"] for e in events)
+
+
+def test_small_files_go_into_the_task_whole(tmp_path):
+    from harness.agent import WHOLE_FILE_LINES, Edits, _task
+    (tmp_path / "small.py").write_text("".join(f"x{i} = {i}\n" for i in range(1, 51)))
+    (tmp_path / "big.py").write_text("".join(f"y{i} = {i}\n" for i in range(1, WHOLE_FILE_LINES + 50)))
+    t = lambda p, line: {"id": "a" * 32, "path": p, "start_line": line, "end_line": line, "title": "T",
+                         "severity": "high", "cwe": None, "tools": ["semgrep"], "message": "m"}
+    ed = Edits(tmp_path, {})
+    small = _task(ed, [t("small.py", 25)], 100_000)
+    assert "The whole of small.py" in small and "x1 = 1" in small and "x50 = 50" in small
+    big = _task(ed, [t("big.py", 200)], 100_000)
+    assert "The whole of" not in big and "y200 = 200" in big and "y1 = 1\n" not in big

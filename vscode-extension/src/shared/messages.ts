@@ -1,6 +1,6 @@
 // Messages between the extension and the webview. The webview never talks to the harness.
 
-import type { AgentEvent, ChatMessage, Finding, SessionInfo } from "./contract";
+import type { AgentEvent, ChatMessage, Finding, SessionInfo, SummaryCard } from "./contract";
 
 export type ConnectionStatus =
   | { state: "connected" }
@@ -43,4 +43,6 @@ export type ToWebview =
   | { type: "agentStart"; id: string; title: string }
   | { type: "agentEvent"; id: string; event: AgentEvent }
   | { type: "agentEnd"; id: string; title: string }
+  /** The scan summary card. `hidden`: likely false alarms hidden by the setting; `error`: scan problems. */
+  | { type: "summaryCard"; card: SummaryCard; hidden: number; error: string | null }
   | { type: "error"; message: string; action?: { label: string; command: string } };

@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 from conftest import FIXTURE, needs_scanners
+from harness.service import UserError
 from mcp_client import call, connect
 
 
@@ -110,3 +111,46 @@ async def test_real_public_repo(server, tokens):
         summary = await call(c, "watch_scan", {"scan_id": s["scan_id"]})
         assert summary["status"] == "done"
         assert (await call(c, "get_session", {"session_id": sid}))["file_count"] >= 1
+
+
+async def test_private_repo_token_goes_to_git_only_as_an_env_header(cfg, monkeypatch, tmp_path):
+    import base64
+    from harness import github, proc
+    calls = []
+
+    async def fake_run(args, cwd=None, env=None, **kw):
+        calls.append((args, env or {}))
+        if args[1] == "clone":
+            (tmp_path / "code" / ".git").mkdir(parents=True)
+            (tmp_path / "code" / "a.py").write_text("x = 1\n")
+        return 0, "abc123", ""
+    monkeypatch.setattr(proc, "run", fake_run)
+    token = "ghp_" + "A1b2C3d4" * 4
+    gh = github.GitHub(cfg)
+    session = {"id": "s", "repo_url": "https://github.com/acme/private-app"}
+    files, _, web = await gh.prepare(session, tmp_path / "code", token)
+    assert files == ["a.py"] and web == "https://github.com/acme/private-app/blob/abc123"
+    clone_args, clone_env = next(c for c in calls if c[0][1] == "clone")
+    assert token not in " ".join(clone_args)  # never on the command line
+    assert clone_env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert base64.b64decode(clone_env["GIT_CONFIG_VALUE_0"].split()[-1]).decode() == f"x-access-token:{token}"
+    rev_env = next(c for c in calls if c[0][1] == "rev-parse")[1]
+    assert "GIT_CONFIG_VALUE_0" not in rev_env  # local commands never get it
+
+    for bad in ["short", "ghp_abc\r\nX-Evil: 1" + "a" * 20, "a b" * 10]:
+        with pytest.raises(UserError, match="token is not valid"):
+            await gh.prepare(session, tmp_path / "code2", bad)
+
+
+async def test_failed_clone_suggests_signing_in(cfg, monkeypatch, tmp_path):
+    from harness import github, proc
+
+    async def failing(args, **kw):
+        return 128, "", "fatal: could not read Username for 'https://github.com'"
+    monkeypatch.setattr(proc, "run", failing)
+    gh = github.GitHub(cfg)
+    session = {"id": "s", "repo_url": "https://github.com/acme/private-app"}
+    with pytest.raises(UserError, match="If the repository is private, sign in to GitHub"):
+        await gh.prepare(session, tmp_path / "c1")
+    with pytest.raises(UserError, match="with your GitHub sign-in"):
+        await gh.prepare(session, tmp_path / "c2", "ghp_" + "x" * 36)

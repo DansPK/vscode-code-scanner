@@ -1,6 +1,7 @@
 """GitHub sessions: shallow clone on the first scan, fetch and diff after that."""
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -14,6 +15,8 @@ from harness.scanners.findings import file_sha256
 
 log = logging.getLogger(__name__)
 
+TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]{20,255}$")  # GitHub tokens; also keeps anything out of the header
+PRIVATE_HINT = "If the repository is private, sign in to GitHub and scan again."
 URL_RE = re.compile(r"^https://github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/([A-Za-z0-9._-]{1,100}?)(?:\.git)?/?$")
 
 
@@ -61,9 +64,14 @@ class GitHub:
     def clone_url(self, owner, repo):
         return f"https://github.com/{owner}/{repo}.git"
 
-    async def _git(self, *args, cwd=None):
-        # Never prompt for credentials; use whatever the server's own git config provides.
+    async def _git(self, *args, cwd=None, token=None):
+        # Never prompt for credentials. A user's token goes in as an HTTP header through git's
+        # environment config: not on the command line (visible in `ps`), not in .git/config, not logged.
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        if token:
+            basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="http.https://github.com/.extraheader",
+                       GIT_CONFIG_VALUE_0=f"AUTHORIZATION: basic {basic}")
         try:
             rc, out, err = await proc.run(["git", *args], cwd=cwd, env=env,
                                           timeout=self.cfg.git_clone_timeout_seconds)
@@ -74,16 +82,20 @@ class GitHub:
             raise GitError(f"git {args[0]} failed")
         return out.strip()
 
-    async def prepare(self, session, code_dir):
-        """Clone or update the repo. Returns (all paths, changed paths, web base URL)."""
+    async def prepare(self, session, code_dir, token=None):
+        """Clone or update the repo. Returns (all paths, changed paths, web base URL).
+        `token`: the user's GitHub token for a private repo, used for this call only."""
         from harness.service import UserError
         owner, repo = parse_url(session["repo_url"])
+        if token is not None and not TOKEN_RE.match(str(token)):
+            raise UserError("the GitHub token is not valid")
+        git = lambda *a, **kw: self._git(*a, token=token, **kw)
         url = self.clone_url(owner, repo)
         code_dir = Path(code_dir)
         try:
             if (code_dir / ".git").is_dir():
                 old = await self._git("rev-parse", "HEAD", cwd=code_dir)
-                await self._git("fetch", "--depth", "1", "--no-tags", "origin", "HEAD", cwd=code_dir)
+                await git("fetch", "--depth", "1", "--no-tags", "origin", "HEAD", cwd=code_dir)
                 new = await self._git("rev-parse", "FETCH_HEAD", cwd=code_dir)
                 changed = set()
                 if new != old:
@@ -95,12 +107,14 @@ class GitHub:
                 if code_dir.exists():
                     shutil.rmtree(code_dir)
                 code_dir.parent.mkdir(parents=True, exist_ok=True)
-                await self._git("clone", "--depth", "1", "--single-branch", "--no-tags", "-q", url, str(code_dir))
+                await git("clone", "--depth", "1", "--single-branch", "--no-tags", "-q", url, str(code_dir))
                 new = await self._git("rev-parse", "HEAD", cwd=code_dir)
                 changed = None
         except GitError as e:
-            raise UserError(f"Could not get {owner}/{repo} from GitHub ({e}). "
-                            "Check that the repository exists and is reachable.") from e
+            if token:
+                raise UserError(f"Could not get {owner}/{repo} from GitHub with your GitHub sign-in ({e}). "
+                                "Check that your account can read it.") from e
+            raise UserError(f"Could not get {owner}/{repo} from GitHub ({e}). {PRIVATE_HINT}") from e
 
         await asyncio.to_thread(_remove_symlinks, code_dir)
         limit = self.cfg.upload_max_unpacked_mb * 1024 * 1024

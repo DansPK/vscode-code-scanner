@@ -13,7 +13,7 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse
 from starlette.routing import Mount
 
-from harness import auth, config, logs, uploads
+from harness import agent, auth, config, logs, uploads
 from harness.db import DB
 from harness.llm import LLM
 from harness.scans import ScanManager
@@ -107,9 +107,10 @@ def build_app(cfg, service=None):
     @tool
     async def start_scan(ctx: Context, session_id: str, upload_id: str | None = None,
                          deleted_paths: list[str] | None = None, full: bool = False,
-                         paths: list[str] | None = None) -> dict:
-        """Start a scan. Returns at once with the scan id. `paths` limits it to some folders or files."""
-        return await service.start_scan(user_id(ctx), session_id, upload_id, deleted_paths, full, paths)
+                         paths: list[str] | None = None, github_token: str | None = None) -> dict:
+        """Start a scan. Returns at once with the scan id. `paths` limits it to some folders or files.
+        `github_token`: the user's own token, for a private GitHub repo; used for this clone only."""
+        return await service.start_scan(user_id(ctx), session_id, upload_id, deleted_paths, full, paths, github_token)
 
     @tool
     async def watch_scan(ctx: Context, scan_id: str) -> dict:
@@ -169,11 +170,13 @@ def build_app(cfg, service=None):
                 await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
         task = asyncio.create_task(cleanup_loop())
+        preload = asyncio.create_task(agent.preload_rules(cfg.semgrep_configs))  # for the fix agent's checks
         try:
             async with inner.router.lifespan_context(inner):
                 yield
         finally:
             task.cancel()
+            preload.cancel()
 
     return Starlette(routes=[Mount("/", app=auth.BearerAuthMiddleware(inner, cfg.tokens_file))],
                      lifespan=lifespan)

@@ -1,7 +1,7 @@
 // The chat panel UI. It talks only to the extension, through postMessage.
 
 import MarkdownIt from "markdown-it";
-import type { AgentEvent, ChatMessage, SessionInfo } from "../src/shared/contract";
+import type { AgentEvent, ChatMessage, SessionInfo, SummaryCard } from "../src/shared/contract";
 import type { ConnectionStatus, FindingView, ToExtension, ToWebview } from "../src/shared/messages";
 
 interface UiState {
@@ -247,6 +247,103 @@ function renderConfirm(id: string, yes: string, no: string) {
   messages.scrollTop = messages.scrollHeight;
 }
 
+// --- scan summary card ---
+
+/** Open the Findings tab on one finding, expanded. */
+function showFinding(id: string) {
+  setTab("findings");
+  ui.query = "";
+  search.value = "";
+  expanded.add(id);
+  saveUi();
+  renderFindings();
+  findingsList.querySelector(`[data-id="${id}"]`)?.scrollIntoView({ block: "center" });
+}
+
+function showFile(path: string) {
+  setTab("findings");
+  ui.query = path;
+  search.value = path;
+  saveUi();
+  renderFindings();
+}
+
+function renderSummaryCard(card: SummaryCard, hidden: number, error: string | null) {
+  const root = el("div", { class: "summary-card" });
+  const sub = card.total === 0 ? "No problems found."
+    : card.false_alarms === card.total ? `All look like false alarms${hidden ? " (hidden)" : ""}.`
+    : `${card.likely_real} likely real${card.false_alarms ? ` · ${card.false_alarms} false alarm${card.false_alarms === 1 ? "" : "s"}${hidden ? " (hidden)" : ""}` : ""}`;
+  root.append(el("div", { class: "sc-head" },
+    el("div", {},
+      el("div", { class: `sc-title${card.total ? "" : " clean"}`, text: card.total ? "Scan complete" : "✓ No findings" }),
+      el("div", { class: "sc-sub", text: sub })),
+    el("div", { class: "sc-total" }, el("strong", { text: String(card.total) }),
+       el("span", { text: card.total === 1 ? "finding" : "findings" }))));
+
+  if (card.total) {
+    const bar = el("div", { class: "sc-bar", role: "img",
+      "aria-label": SEVERITIES.filter((s) => card.counts[s as keyof typeof card.counts])
+        .map((s) => `${card.counts[s as keyof typeof card.counts]} ${s}`).join(", ") });
+    const legend = el("div", { class: "sc-legend" });
+    for (const s of SEVERITIES) {
+      const n = card.counts[s as keyof typeof card.counts] ?? 0;
+      if (!n) continue;
+      const seg = el("span", { class: `sev-${s}` });
+      seg.style.flexGrow = String(n);
+      bar.append(seg);
+      legend.append(el("span", { class: `sc-chip sev-${s}` }, el("span", { class: "sev-dot" }), `${n} ${s}`));
+    }
+    root.append(bar, legend);
+  }
+
+  const section = (label: string, ...children: Node[]) =>
+    root.append(el("div", { class: "sc-section" }, el("div", { class: "sc-label", text: label }), ...children));
+  if (card.overall) section("Overall", el("div", { class: "sc-overall", text: card.overall }));
+  if (card.fix_first.length) {
+    const list = el("ol", { class: "sc-fix" });
+    card.fix_first.forEach((item, i) => {
+      const id = item.finding_ids[0];
+      const text = el(id ? "button" : "span", { class: "sc-fix-text", text: item.text,
+                                               ...(id ? { title: "Show this finding" } : {}) });
+      if (id) text.onclick = () => showFinding(id);
+      const li = el("li", {}, el("span", { class: "sc-num", text: String(i + 1) }), text);
+      if (id && isWorkspace()) {
+        li.append(button("Fix", "secondary small", () => {
+          setTab("chat");
+          send({ type: "fix", ids: item.finding_ids });
+        }, "Let the fix agent fix this"));
+      }
+      list.append(li);
+    });
+    section("Fix first", list);
+  }
+  if (card.files.length) {
+    const files = el("div", { class: "sc-files" });
+    for (const f of card.files) {
+      const { dir, name } = splitPath(f.path);
+      const row = button("", "sc-file", () => showFile(f.path), `Show the findings in ${f.path}`);
+      row.append(el("span", { class: "sc-file-name", text: name }),
+                 el("span", { class: "sc-file-dir" }, el("span", { dir: "ltr", text: dir.replace(/\/$/, "") })),
+                 el("span", { class: "count", text: String(f.count) }));
+      files.append(row);
+    }
+    section("Most affected", files);
+  }
+  if (error) root.append(el("div", { class: "sc-warn", text: `Some steps had problems: ${error}` }));
+
+  const actions = el("div", { class: "sc-actions" });
+  if (card.likely_real && isWorkspace()) {
+    actions.append(button("Fix all", "", () => send({ type: "send", text: "Fix all findings" }),
+                          "Let the fix agent fix every finding that is not a likely false alarm"));
+  }
+  if (card.total) actions.append(button("View findings", "secondary", () => setTab("findings")));
+  if (actions.childElementCount) root.append(actions);
+
+  messages.append(root);
+  updateWelcome();
+  messages.scrollTop = messages.scrollHeight;
+}
+
 // --- fix agent transcript ---
 
 interface AgentBlock { root: HTMLDetailsElement; title: HTMLElement; body: HTMLElement; files: Map<string, HTMLElement> }
@@ -416,7 +513,7 @@ function renderFinding(f: FindingView) {
   const v = pendingReview(f) ? { label: "Reviewing…", cls: "pending" }
     : VERDICT[f.verdict] ?? { label: f.verdict, cls: "unsure" };
   const isOpen = expanded.has(f.id);
-  const row = el("div", { class: `finding sev-${f.severity}${isOpen ? " open" : ""}` });
+  const row = el("div", { class: `finding sev-${f.severity}${isOpen ? " open" : ""}`, "data-id": f.id });
 
   const head = el("button", { class: "finding-head", "aria-expanded": String(isOpen), title: f.title },
     el("span", { class: `badge sev-${f.severity}`, text: BADGE[f.severity] ?? f.severity.toUpperCase() }),
@@ -577,6 +674,9 @@ window.addEventListener("message", (event: MessageEvent<ToWebview>) => {
       break;
     case "message":
       renderMessage(msg.message);
+      break;
+    case "summaryCard":
+      renderSummaryCard(msg.card, msg.hidden, msg.error);
       break;
     case "agentStart":
       agentStart(msg.id, msg.title);

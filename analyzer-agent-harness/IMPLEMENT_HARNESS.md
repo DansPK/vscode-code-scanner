@@ -155,19 +155,19 @@ All tools return JSON objects. On error, the tool returns an MCP error result wi
 | `delete_session` | `session_id` | `ok` |
 | `sync_files` | `session_id`, `manifest` | `need` (list of paths), `delete` (list of paths), `unchanged_count` |
 | `request_upload` | `session_id`, `size_bytes`, `sha256` | `upload_id`, `upload_url`, `expires_at` |
-| `start_scan` | `session_id`, `upload_id` (optional), `deleted_paths` (optional), `full` (optional boolean, default false), `paths` (optional list of folders or files to limit the scan to; findings for other files are kept from the previous scan) | `scan_id` |
+| `start_scan` | `session_id`, `upload_id` (optional), `deleted_paths` (optional), `full` (optional boolean, default false), `paths` (optional list of folders or files to limit the scan to; findings for other files are kept from the previous scan), `github_token` (optional; `github` sessions only: the user's own GitHub token for a private repository, used for this clone or fetch only, never stored or logged) | `scan_id` |
 | `watch_scan` | `scan_id` | Sends progress notifications while the scan runs. Returns the final scan summary when it ends. |
 | `get_scan_status` | `scan_id` | scan summary (see below) |
 | `cancel_scan` | `scan_id` | `ok` |
 | `get_findings` | `session_id`, `scan_id` (optional, default latest), `severity` (optional list), `tool` (optional list), `path` (optional), `limit` (default 200), `offset` (default 0) | `findings`, `total` |
 | `chat` | `session_id`, `message` | `reply` (Markdown text), `finding_ids` (findings the reply talks about), `action` (a chat action, or null) |
-| `summarize_findings` | `session_id` | `summary` (short Markdown about the latest finished scan: counts, the most affected files, and up to three things to fix first), `finding_ids`. Not saved in the chat history; the extension shows it after each scan. |
+| `summarize_findings` | `session_id` | `summary` (short Markdown about the latest finished scan: counts, the most affected files, and up to three things to fix first), `finding_ids`, and `card`, the same as data: `total`, `counts` (per severity), `likely_real`, `false_alarms`, `files` (up to three `{path, count}`), `overall` (one sentence or null), `fix_first` (up to three `{text, finding_ids}`; the ids are not repeated in `text`). Not saved in the chat history; the extension draws `card` after each scan. |
 | `fix_findings` | `session_id`, `finding_ids` (from the latest finished scan, at most 200) | Runs the fix agent. Streams its work as progress notifications (see "Fix agent events"). Returns a fix result (see below). Nothing is changed on either side. |
 
 Rules:
 
 - A user can only see and change their own sessions. Any other `session_id` returns "session not found".
-- For a `github` session, `sync_files` and `request_upload` are not used. `start_scan` clones the repo the first time and pulls after that.
+- For a `github` session, `sync_files` and `request_upload` are not used. `start_scan` clones the repo the first time and pulls after that. If the clone fails without a `github_token`, the error message contains "If the repository is private, sign in to GitHub and scan again." so the extension can offer a sign-in.
 - Only one scan runs per session at a time. A second `start_scan` while one is running returns an error.
 - Each `chat` call is saved to the session's history, both the user message and the reply.
 - `get_findings` with the `scan_id` of a running scan returns the findings found so far. A finding whose `explanation` is empty has not been reviewed by the LLM yet.

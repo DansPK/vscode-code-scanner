@@ -63,9 +63,12 @@ test("scan this project: progress, summary, findings, Problems panel, open at li
   assert.ok(liveLists.some((m) => m.findings.some((f) => f.explanation === "")),
     "findings were shown before their review finished");
   assert.ok(posted.some((m) => m.type === "progress" && !m.done), "progress lines");
-  assert.ok(texts().some((t) => t.startsWith("**2 findings.** Fix the SQL injection first.")
-    && /1 likely false alarm is hidden/.test(t)), "short summary shown by itself after the scan");
-  assert.ok(texts().some((t) => /sonarqube/.test(t)), "failed scanner is named");
+  const card = last("summaryCard");
+  assert.ok(card, "summary card shown by itself after the scan");
+  assert.equal(card!.card.total, 2);
+  assert.equal(card!.hidden, 1);
+  assert.deepEqual(card!.card.fix_first[0].finding_ids, ["f0"]);
+  assert.match(last("summaryCard")!.error ?? "", /sonarqube/, "failed scanner is named");
   const f = last("findings")!;
   assert.equal(f.total, 2);
   assert.equal(f.hidden, 1);
@@ -269,6 +272,38 @@ test("a GitHub link scans the repo and findings open in the browser", async () =
     assert.equal(opened, "https://github.com/acme/app/blob/abc/app.js#L2-L3");
   } finally {
     env.openExternal = orig;
+  }
+});
+
+test("a private GitHub repo: sign in with VS Code's GitHub account, then it scans", async () => {
+  const auth = vscode.authentication as any;
+  const orig = auth.getSession;
+  const asked: { scopes: string[]; opts: any }[] = [];
+  try {
+    auth.getSession = async (provider: string, scopes: string[], opts: any) => {
+      asked.push({ scopes, opts });
+      return provider === "github" ? { accessToken: "gho_" + "t".repeat(36) } : undefined;
+    };
+    posted = [];
+    await controller.send("scan https://github.com/acme/private-app");
+    assert.ok(texts().some((t) => /If this is a private repository, sign in to GitHub/.test(t)));
+    assert.equal(asked.length, 0, "no sign-in before the user agrees");
+    const ask = last("confirm")!;
+    assert.equal(ask.yes, "Sign in to GitHub");
+    await controller.handle({ type: "confirm", id: ask.id, accept: true });
+    assert.deepEqual(asked[0].scopes, ["repo"]);
+    assert.equal(asked[0].opts.createIfNone, true);
+    const starts = fake.calls.filter((c) => c.name === "start_scan");
+    assert.equal(starts[starts.length - 1].args.github_token, "gho_" + "t".repeat(36));
+    assert.ok(last("summaryCard"), "the private repo was scanned");
+
+    posted = [];
+    await controller.send("rescan"); // the session is known to be private: silent sign-in, no question
+    assert.equal(asked[asked.length - 1].opts.silent, true);
+    assert.ok(!last("confirm"));
+    assert.ok(!JSON.stringify(posted).includes("t".repeat(36)), "the token never reaches the webview");
+  } finally {
+    auth.getSession = orig;
   }
 });
 

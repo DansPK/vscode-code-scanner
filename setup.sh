@@ -96,6 +96,12 @@ if [[ ${#SECRET} -lt 32 || $SECRET == change-me* ]]; then
   setenv HARNESS_SIGNING_SECRET "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
 fi
 
+SX=$(getenv SEARXNG_SECRET)
+if [[ ${#SX} -lt 32 ]]; then
+  say "Generating SEARXNG_SECRET (web search for the agents)"
+  setenv SEARXNG_SECRET "$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+fi
+
 # --- ports -------------------------------------------------------------------
 say "Choosing ports"
 HP=$(current_port harness 8080); [[ -n $HP ]] || HP=$(free_port 8080)

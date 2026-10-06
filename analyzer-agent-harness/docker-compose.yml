@@ -8,12 +8,23 @@ services:
       HARNESS_DATA_DIR: /data
       HARNESS_TOKENS_FILE: /data/tokens.json
       SONAR_HOST_URL: http://sonarqube:9000
+      # The agents' web search; set WEB_SEARCH_URL= (empty) in .env to turn it off.
+      WEB_SEARCH_URL: ${WEB_SEARCH_URL-http://searxng:8080}
     volumes:
       - harness-data:/data
       # TLS certificate and key, if HARNESS_TLS_CERT/HARNESS_TLS_KEY point here (scripts/make_dev_cert.sh)
       - ./certs:/certs:ro
     depends_on:
       - sonarqube
+      - searxng
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?run setup.sh or set SEARXNG_SECRET in .env}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
     restart: unless-stopped
 
   sonarqube:

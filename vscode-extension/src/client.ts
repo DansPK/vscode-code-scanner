@@ -4,7 +4,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { FetchFn, tlsErrorCode } from "./http";
-import type { ChatReply, FindingsPage, FixResult, ManifestEntry, ScanSummary, SessionDetail, SessionInfo, SyncResult,
+import type { ChatReply, FindingsPage, FixResult, ManifestEntry, SummaryCard, ScanSummary, SessionDetail, SessionInfo, SyncResult,
   UploadTicket } from "./shared/contract";
 
 export const TOKEN_REJECTED = "Token rejected. Run Vuln Scanner: Set Token.";
@@ -138,7 +138,8 @@ export class HarnessClient {
     return this.call<UploadTicket>("request_upload", { session_id, size_bytes, sha256 });
   }
   startScan(session_id: string,
-            opts: { upload_id?: string; deleted_paths?: string[]; full?: boolean; paths?: string[] } = {}) {
+            opts: { upload_id?: string; deleted_paths?: string[]; full?: boolean; paths?: string[];
+                    github_token?: string } = {}) {
     return this.call<{ scan_id: string }>("start_scan", { session_id, ...opts });
   }
   watchScan(scan_id: string, onProgress: (percent: number, message: string) => void, signal?: AbortSignal) {
@@ -159,7 +160,7 @@ export class HarnessClient {
     return this.call<ChatReply>("chat", { session_id, message });
   }
   summarizeFindings(session_id: string) {
-    return this.call<{ summary: string; finding_ids: string[] }>("summarize_findings", { session_id });
+    return this.call<{ summary: string; finding_ids: string[]; card: SummaryCard }>("summarize_findings", { session_id });
   }
   fixFindings(session_id: string, finding_ids: string[], onProgress: (percent: number, message: string) => void,
               signal?: AbortSignal) {

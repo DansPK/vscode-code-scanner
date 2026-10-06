@@ -19,14 +19,14 @@ Apart from a **Rescan** button, you tell the assistant what you want, in your ow
 | "scan this project", "check my changes", "rescan" | Sends only the files that changed since the last scan, then scans |
 | "scan everything again from scratch" | A full scan |
 | "scan only the backend api", "just check src/auth" | Scans only that folder; findings for the rest are kept |
-| a GitHub link, e.g. "scan https://github.com/owner/repo" | Scans that repo on the server (a GitHub session) |
+| a GitHub link, e.g. "scan https://github.com/owner/repo" | Scans that repo on the server (a GitHub session). For a private repo you are asked to **Sign in to GitHub** (VS Code's own GitHub account, "repo" access); later rescans reuse it without asking |
 | "fix all high findings", "fix src/db.py", "fix it", "fix all findings" (or **Fix all** on the Findings tab) | The fix agent reads the code, edits what is needed (also imports or other files), reruns the scanners, and reports what it fixed (it asks first when there are more than 10 findings). One file: a diff with **Apply fix** / **Skip**. Several files: **Apply all**, or **Review one by one**, which shows each file's diff in turn |
 | "summarize all findings" (or the **Summarize** button on the Findings tab) | A report: counts, most affected files, top risks, and what to fix first |
 | "stop" / "cancel the scan" | Stops the running scan (the **Stop** button next to the progress bar does the same) |
 | "is my login code safe?" | When the agent only *thinks* a scan would help, it asks first: **Yes, scan** / **No** |
 | anything else | The agent answers, using the findings and your code |
 
-When a scan ends, a short summary appears in the chat: counts, the most affected files, and up to three things to fix first. After you save files that have findings, the **Rescan** button above the chat lights up ("Rescan · 2 changed"). If the LLM cannot be reached, simple scan commands ("scan", "rescan", a GitHub link, "stop") still work. Enter sends; Shift+Enter adds a new line.
+When a scan ends, a summary card appears in the chat: a severity bar, one sentence on the overall risk, up to three things to fix first (click one to open the finding, or **Fix** it), the most affected files (click to filter), and **Fix all** / **View findings**. After you save files that have findings, the **Rescan** button above the chat lights up ("Rescan · 2 changed"). If the LLM cannot be reached, simple scan commands ("scan", "rescan", a GitHub link, "stop") still work. Enter sends; Shift+Enter adds a new line.
 
 **Findings** appear while the scan runs, as each scanner finishes; ones the LLM has not reviewed yet say *Reviewing…*. They are grouped by severity, then by file. Expand one to read the explanation, how to fix it, and a suggested patch (with a copy button). **Fix** asks the assistant for a fix you can review as a diff before it is applied. It works only on a saved file that has not changed since the last upload, so rescan first if you edited it. **Open** jumps to the lines in the editor, or opens GitHub for a GitHub session. If the file changed since the scan, you get a note to rescan. Workspace findings also show as squiggles and in the Problems panel.
 

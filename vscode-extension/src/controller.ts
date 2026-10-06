@@ -19,6 +19,19 @@ import { CancelledError, hashFile } from "./workspaceFiles";
 export const TOKEN_KEY = "vulnScanner.token";
 const LAST_SESSION_KEY = "vulnScanner.lastSession";
 const SESSION_FOLDERS_KEY = "vulnScanner.sessionFolders";
+const PRIVATE_REPOS_KEY = "vulnScanner.privateRepoSessions"; // GitHub sessions that needed a sign-in
+const PRIVATE_HINT = /If the repository is private, sign in to GitHub and scan again\./;
+
+/** The user's GitHub token from VS Code's built-in GitHub sign-in ("repo" scope reads private repos).
+ * Never stored or logged by the extension; passed to the harness for one download. */
+async function githubToken(prompt: boolean): Promise<string | undefined> {
+  try {
+    const s = await vscode.authentication.getSession("github", ["repo"], prompt ? { createIfNone: true } : { silent: true });
+    return s?.accessToken;
+  } catch {
+    return undefined; // cancelled, or no GitHub sign-in available
+  }
+}
 const LIVE_REFRESH_MS = 1500;
 const FIX_SCHEME = "vulnscanner-fix";
 const OUTCOME_LABEL: Record<FixOutcome["status"], string> = {
@@ -527,25 +540,44 @@ export class Controller implements vscode.Disposable {
       await this.useSession(await this.createSession("github", url));
       s = this.currentSession();
     }
-    const { scan_id } = await client.startScan(s!.session_id, {
-      full: opts.full || undefined, paths: opts.paths?.length ? opts.paths : undefined });
-    await this.follow(client, s!.session_id, scan_id);
+    const sessionId = s!.session_id;
+    const start = (github_token?: string) => client.startScan(sessionId, {
+      full: opts.full || undefined, paths: opts.paths?.length ? opts.paths : undefined, github_token });
+    const privateRepos = this.ctx.workspaceState.get<string[]>(PRIVATE_REPOS_KEY, []);
+    let token: string | undefined;
+    if (privateRepos.includes(sessionId)) token = await githubToken(false); // signed in before: no prompt
+    let scanId: string;
+    try {
+      scanId = (await start(token)).scan_id;
+    } catch (e) {
+      if (!(e instanceof ToolCallError && PRIVATE_HINT.test(e.message))) throw e;
+      // GitHub refused without a sign-in: maybe a private repository. Offer VS Code's own GitHub sign-in.
+      this.say(`${e.message.replace(PRIVATE_HINT, "").trim()}\n\nIf this is a private repository, sign in to `
+        + "GitHub and I'll scan it with your account. The sign-in stays in VS Code; the scanner server uses it "
+        + "for this download only and does not store it.");
+      this.ask("Sign in to GitHub", async () => {
+        const signedIn = await githubToken(true);
+        if (!signedIn) {
+          this.say("GitHub sign-in was cancelled.");
+          return;
+        }
+        const { scan_id } = await start(signedIn);
+        await this.ctx.workspaceState.update(PRIVATE_REPOS_KEY, [...new Set([...privateRepos, sessionId])]);
+        await this.follow(client, sessionId, scan_id);
+      }, "Not now");
+      return;
+    }
+    await this.follow(client, sessionId, scanId);
   }
 
   /** After a scan: the harness's short summary, with what only the extension knows (hidden findings,
    * scan errors). If the summary cannot be made, the plain counts. */
   private async showScanSummary(client: HarnessClient, sessionId: string, counts: ScanSummary["counts"],
                                 error: string | null) {
-    const tail: string[] = [];
-    if (this.hiddenCount) {
-      tail.push(`_${this.hiddenCount} likely false alarm${this.hiddenCount === 1 ? " is" : "s are"} hidden in the Findings tab._`);
-    }
-    if (error) tail.push(`Some steps had problems: ${error}`);
     this.post({ type: "thinking", on: true });
     try {
       const s = await client.summarizeFindings(sessionId);
-      this.post({ type: "message", message: { role: "assistant", text: [s.summary, ...tail].join("\n\n"),
-                                              finding_ids: s.finding_ids } });
+      this.post({ type: "summaryCard", card: s.card, hidden: this.hiddenCount, error });
     } catch (e) {
       log.warn(`Summary failed: ${(e as Error).message}`);
       const newCount = this.findings.filter((f) => f.status === "new").length;

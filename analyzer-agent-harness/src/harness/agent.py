@@ -12,11 +12,13 @@ import hashlib
 import json
 import logging
 import tempfile
+import threading
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from harness import files as files_mod
-from harness import fix
+from harness import fix, web
 from harness.llm import LLMError, LLMUnreachable
 from harness.scanners import gitleaks, semgrep
 from harness.scanners.findings import SEVERITIES, mask_lines
@@ -28,6 +30,7 @@ MAX_CHECKS = 3
 READ_MAX_LINES = 300
 TOOL_RESULT_CHARS = 12000
 TASK_CONTEXT_LINES = 15
+WHOLE_FILE_LINES = 300  # files up to this size go into the task whole
 TEXT_FLUSH_SECONDS = 0.25
 
 SYSTEM = """You are a coding agent that fixes security findings in a project. Work like a careful engineer:
@@ -209,20 +212,38 @@ def line_edits(orig, new):
 # --- checking with the scanners ---
 
 _rules = {}
+_rules_lock = threading.Lock()
+
+
+def _load_rules(path):
+    """Parse a rule file once per process. The result is stored by the worker thread itself, so a
+    cancelled preload still fills the cache."""
+    import yaml
+    with _rules_lock:
+        if path not in _rules:
+            _rules[path] = yaml.safe_load(Path(path).read_text()).get("rules", [])
+    return _rules[path]
+
+
+async def preload_rules(configs):
+    """Parse the rule files ahead of the first check (about 7 s for the merged file)."""
+    try:
+        await _rules_for(configs, ())
+    except Exception:  # only an optimisation; the first check loads them otherwise
+        log.warning("could not preload the Semgrep rules", exc_info=True)
 
 
 async def _rules_for(configs, rule_ids):
     """Only the given Semgrep rules, from the local rule files. Loading 1000+ rules takes Semgrep
     about 50 s; a handful takes a few seconds."""
-    import yaml
     wanted, out = set(rule_ids), []
     for c in configs:
-        p = Path(c)
-        if not p.is_file():
+        if not Path(c).is_file():
             continue
-        if c not in _rules:
-            _rules[c] = await asyncio.to_thread(lambda: yaml.safe_load(p.read_text()).get("rules", []))
-        out += [r for r in _rules[c] if r.get("id") in wanted]
+        rules = _rules.get(c)
+        if rules is None:
+            rules = await asyncio.to_thread(_load_rules, c)
+        out += [r for r in rules if r.get("id") in wanted]
     return out
 
 
@@ -267,21 +288,33 @@ async def still_reported(edits, targets, all_findings, configs):
 
 # --- the agent loop ---
 
-def _task(edits, group):
+def _task(edits, group, max_chars):
+    """The findings, and the code: a small file whole (saves the agent a read_file call), else the
+    lines around each finding."""
     parts = ["Fix these findings:"]
+    whole = None
+    try:
+        f = edits.file(group[0]["path"])
+        text = _numbered(f["masked"], 1)
+        if len(f["masked"]) <= WHOLE_FILE_LINES and len(text) <= max_chars // 2:
+            whole = text
+    except AgentError:
+        pass
     for t in group:
-        try:
-            f = edits.file(t["path"])
-            first = max(t["start_line"] - TASK_CONTEXT_LINES, 1)
-            last = min(t["end_line"] + TASK_CONTEXT_LINES, len(f["masked"]))
-            code = _numbered(f["masked"][first - 1:last], first)
-        except AgentError as e:
-            code = str(e)
         parts.append(
             f"\n- id `{t['id']}`: {t['title']} ({t['severity']}, {t['cwe'] or 'no CWE'}, found by {', '.join(t['tools'])})\n"
             f"  File {t['path']}, lines {t['start_line']}-{t['end_line']}. Scanner: {t['message'][:300]}\n"
-            f"  Reviewer's advice: {(t.get('fix_recommendation') or 'none')[:400]}\n"
-            f"  Code as it is now:\n{code}")
+            f"  Reviewer's advice: {(t.get('fix_recommendation') or 'none')[:400]}")
+        if whole is None:
+            try:
+                f = edits.file(t["path"])
+                first = max(t["start_line"] - TASK_CONTEXT_LINES, 1)
+                last = min(t["end_line"] + TASK_CONTEXT_LINES, len(f["masked"]))
+                parts.append(f"  Code around it:\n{_numbered(f['masked'][first - 1:last], first)}")
+            except AgentError as e:
+                parts.append(f"  {e}")
+    if whole is not None:
+        parts.append(f"\nThe whole of {group[0]['path']} as it is now (no need to read it again):\n{whole}")
     return "\n".join(parts)
 
 
@@ -290,7 +323,10 @@ def _describe(name, args):
     if name == "read_file":
         lines = f":{args.get('start_line')}-{args.get('end_line') or ''}" if args.get("start_line") else ""
         return f"Read {args.get('path', '')}{lines}"
+    if name == "fetch_url":
+        return f"Fetch {urlsplit(str(args.get('url', ''))).hostname or args.get('url', '')}"
     return {"search_code": f"Search {str(args.get('query', ''))[:60]!r}", "edit_file": f"Edit {args.get('path', '')}",
+            "web_search": f"Web search {str(args.get('query', ''))[:60]!r}",
             "check_fixes": "Check with the scanners", "finish": "Finish"}.get(name, name)
 
 
@@ -305,6 +341,14 @@ def _outcome(name, args, result):
         return "no matches" if text == "No matches." else f"{text.count(chr(10)) + 1} matches"
     if name == "edit_file":
         return f"+{len(str(args.get('new_text', '')).splitlines())} −{len(str(args.get('old_text', '')).splitlines())} lines"
+    if name == "web_search":
+        n = text.count('"url"')
+        return f"{n} result{'s' if n != 1 else ''}"
+    if name == "fetch_url":
+        try:
+            return json.loads(text).get("title") or "read"
+        except ValueError:
+            return "read"
     if name == "check_fixes":
         states = Counter("still reported" if "STILL" in l else "not changed" if "not changed" in l
                          else "not checkable" if "cannot be checked" in l else "no longer reported"
@@ -313,13 +357,15 @@ def _outcome(name, args, result):
     return ""
 
 
-async def run_agent(llm, edits, group, all_findings, configs, say):
+async def run_agent(llm, edits, group, all_findings, configs, say, web_url=None):
     """Fix one group of findings. Returns {"summary", "fixed", "not_fixed"}; raises LLMError when
     the server cannot handle tool calls at all (the caller then falls back to one-shot fixes)."""
-    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": _task(edits, group)}]
+    tools_all = TOOLS + web.TOOLS if web_url else TOOLS
+    messages = [{"role": "system", "content": SYSTEM + ("\n" + web.PROMPT if web_url else "")},
+                {"role": "user", "content": _task(edits, group, llm.max_code_chars)}]
     checks = 0
     for step in range(MAX_STEPS):
-        tools = TOOLS if step < MAX_STEPS - 1 else [t for t in TOOLS if t["function"]["name"] == "finish"]
+        tools = tools_all if step < MAX_STEPS - 1 else [t for t in TOOLS if t["function"]["name"] == "finish"]
         reply = await llm.complete(messages, tools, on_text=lambda d, thinking: say("thinking" if thinking else "text", d))
         calls = reply.get("tool_calls") or []
         if not calls:
@@ -353,6 +399,8 @@ async def run_agent(llm, edits, group, all_findings, configs, say):
                         else:
                             still, unchecked = await still_reported(edits, group, all_findings, configs)
                             result = _check_text(group, edits, still, unchecked)
+                    elif web_url and c["name"] in web.NAMES:
+                        result = json.dumps(await web.call(web_url, c["name"], args))
                     elif c["name"] == "finish":
                         done = args
                         result = "Done."
@@ -447,7 +495,7 @@ async def fix_findings(llm, cfg, code_dir, targets, all_findings, report):
             r = None
             if use_tools:
                 try:
-                    r = await run_agent(llm, edits, group, all_findings, cfg.semgrep_configs, say)
+                    r = await run_agent(llm, edits, group, all_findings, cfg.semgrep_configs, say, cfg.web_search_url)
                 except LLMUnreachable:
                     raise
                 except LLMError as e:
