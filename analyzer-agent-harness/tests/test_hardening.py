@@ -64,3 +64,10 @@ def test_signatures_are_redacted():
     f = logs.RedactingFormatter("%(message)s")
     rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, "PUT /uploads/x?expires=1&sig=abc123 201", (), None)
     assert f.format(rec) == "PUT /uploads/x?expires=1&sig=*** 201"
+
+
+def test_unnamed_sessions_get_a_random_two_word_name():
+    from harness.service import ADJECTIVES, NOUNS, random_name
+    for _ in range(20):
+        adj, noun = random_name().split(" ")
+        assert adj in ADJECTIVES and noun in NOUNS

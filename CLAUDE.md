@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Two components, built from the plans in each folder (`IMPLEMENT_HARNESS.md`, `IMPLEMENT_VSCODE_EXTENSION.md`). The plans are the source of truth. Choices made where a plan was silent are recorded in each folder's `PLAN_QUESTIONS.md`.
+Two components, built from the plans in `docs/` (`docs/harness/IMPLEMENT_HARNESS.md`, `docs/extension/IMPLEMENT_VSCODE_EXTENSION.md`). The plans are the source of truth. Choices made where a plan was silent are recorded in the `PLAN_QUESTIONS.md` next to each plan. Setup and flow docs are in `docs/` too (`SETUP.md`, `PROJECT_FLOW.md`, `SOURCE_CODE_ANALYSIS_FLOW.md`).
 
 ## Commands
 

@@ -33,6 +33,17 @@ class UserError(Exception):
     """An error whose message is shown to the user as-is."""
 
 
+ADJECTIVES = ("Quiet", "Amber", "Brave", "Calm", "Clever", "Crimson", "Gentle", "Golden", "Hidden", "Lucky",
+              "Misty", "Nimble", "Patient", "Silver", "Sunny", "Swift", "Velvet", "Wandering", "Bright", "Frosty")
+NOUNS = ("Falcon", "Harbor", "Lantern", "Meadow", "River", "Comet", "Willow", "Otter", "Summit", "Canyon",
+         "Ember", "Orchard", "Beacon", "Glacier", "Heron", "Maple", "Pebble", "Thunder", "Fox", "Island")
+
+
+def random_name():
+    """A friendly session name such as "Misty Harbor"."""
+    return f"{secrets.choice(ADJECTIVES)} {secrets.choice(NOUNS)}"
+
+
 class Service:
     def __init__(self, cfg, db, scans, llm, sonar_client=None, github=None):
         self.cfg = cfg
@@ -91,7 +102,7 @@ class Service:
             name = name or f"{owner}/{repo}"
         else:
             repo_url = None
-        name = (name or f"Workspace scan {now()[:16].replace('T', ' ')}").strip()[:MAX_NAME]
+        name = (name or random_name()).strip()[:MAX_NAME]
         sid = secrets.token_hex(12)
         ts = now()
         self.db.run("INSERT INTO sessions (id, owner, name, target_type, repo_url, created_at, updated_at) "

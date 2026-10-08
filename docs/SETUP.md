@@ -53,7 +53,7 @@ sed -i "s#^HARNESS_SIGNING_SECRET=.*#HARNESS_SIGNING_SECRET=$(openssl rand -hex 
 
 To check the model id, run `curl <LLM_BASE_URL>/models` and use one of the `id` values.
 
-Optional settings, such as `LLM_MAX_PARALLEL`, `LLM_TIMEOUT_SECONDS` and `UPLOAD_MAX_MB`, are listed with their defaults in [IMPLEMENT_HARNESS.md](analyzer-agent-harness/IMPLEMENT_HARNESS.md).
+Optional settings, such as `LLM_MAX_PARALLEL`, `LLM_TIMEOUT_SECONDS` and `UPLOAD_MAX_MB`, are listed with their defaults in [IMPLEMENT_HARNESS.md](harness/IMPLEMENT_HARNESS.md).
 
 ## 2. If ports 8080 or 9000 are already in use
 

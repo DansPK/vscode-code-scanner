@@ -49,7 +49,7 @@ In VS Code, set `vulnScanner.serverUrl` to `https://localhost:8080` and `vulnSca
 
 ## Configuration
 
-All settings are environment variables. See the table in `IMPLEMENT_HARNESS.md` for the full list and defaults. Required: `HARNESS_PUBLIC_URL`, `HARNESS_TOKENS_FILE`, `HARNESS_SIGNING_SECRET`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `SONAR_HOST_URL`, `SONAR_TOKEN`. The compose file sets `HARNESS_TOKENS_FILE` and `SONAR_HOST_URL` for you.
+All settings are environment variables. See the table in [IMPLEMENT_HARNESS.md](../docs/harness/IMPLEMENT_HARNESS.md) for the full list and defaults. Required: `HARNESS_PUBLIC_URL`, `HARNESS_TOKENS_FILE`, `HARNESS_SIGNING_SECRET`, `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL`, `SONAR_HOST_URL`, `SONAR_TOKEN`. The compose file sets `HARNESS_TOKENS_FILE` and `SONAR_HOST_URL` for you.
 
 `LLM_MODEL` uses LiteLLM's naming, for example `openai/qwen2.5-coder` for an OpenAI-compatible server. To reach an LLM on the Docker host, use `http://host.docker.internal:<port>/v1` as `LLM_BASE_URL`.
 

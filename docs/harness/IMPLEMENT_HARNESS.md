@@ -2,7 +2,7 @@
 
 This file is for a coding agent. It explains what to build, in what order, and how to check each step. It contains no code on purpose. Make your own design choices where this file is silent, and keep them simple.
 
-The matching file for the VS Code extension is `IMPLEMENT_VSCODE_EXTENSION.md`. Both files share the same "Shared contract" section.
+The matching file for the VS Code extension is [IMPLEMENT_VSCODE_EXTENSION.md](../extension/IMPLEMENT_VSCODE_EXTENSION.md). Both files share the same "Shared contract" section.
 
 ## What you are building
 

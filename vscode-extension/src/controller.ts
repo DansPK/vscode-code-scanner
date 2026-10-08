@@ -362,8 +362,7 @@ export class Controller implements vscode.Disposable {
 
   private async createSession(type: "workspace" | "github", repoUrl?: string): Promise<string> {
     const client = await this.ready();
-    const name = type === "workspace" ? vscode.workspace.workspaceFolders?.[0]?.name : undefined;
-    const { session_id } = await client.createSession(type, repoUrl, name);
+    const { session_id } = await client.createSession(type, repoUrl);
     await this.refreshSessions();
     return session_id;
   }

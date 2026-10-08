@@ -2,7 +2,7 @@
 
 How a request travels through vscode-code-scanner: from typing in the chat panel, through the harness and its scanners, to findings in the editor and fixes applied to files.
 
-For setup see [SETUP.md](SETUP.md). For the exact API see the "Shared contract" section in either plan file ([harness](analyzer-agent-harness/IMPLEMENT_HARNESS.md), [extension](vscode-extension/IMPLEMENT_VSCODE_EXTENSION.md)).
+For setup see [SETUP.md](SETUP.md). For the exact API see the "Shared contract" section in either plan file ([harness](harness/IMPLEMENT_HARNESS.md), [extension](extension/IMPLEMENT_VSCODE_EXTENSION.md)).
 
 ## 1. The pieces
 
@@ -37,14 +37,14 @@ flowchart LR
 
 | Piece | Role |
 | --- | --- |
-| Webview ([main.ts](vscode-extension/webview/main.ts)) | Draws the chat, progress, findings, summary card and fix transcript. Talks only to the controller. |
-| Controller ([controller.ts](vscode-extension/src/controller.ts)) | The only VS Code glue: token, sessions, scans, diagnostics, diffs, applying fixes. |
+| Webview ([main.ts](../vscode-extension/webview/main.ts)) | Draws the chat, progress, findings, summary card and fix transcript. Talks only to the controller. |
+| Controller ([controller.ts](../vscode-extension/src/controller.ts)) | The only VS Code glue: token, sessions, scans, diagnostics, diffs, applying fixes. |
 | Pure modules (`src/*.ts`) | Walk and hash files, pack the tar.gz, upload, call MCP tools. Unit-tested without VS Code. |
-| Harness ([app.py](analyzer-agent-harness/src/harness/app.py)) | Thin MCP tool wrappers. Each one reads the user from the token and calls `Service`. |
-| Service ([service.py](analyzer-agent-harness/src/harness/service.py)) | Sessions, file sync, uploads, chat routing, summary, fix requests. |
-| ScanManager ([scans.py](analyzer-agent-harness/src/harness/scans.py)) | Runs scans as background asyncio tasks and publishes progress and partial findings. |
+| Harness ([app.py](../analyzer-agent-harness/src/harness/app.py)) | Thin MCP tool wrappers. Each one reads the user from the token and calls `Service`. |
+| Service ([service.py](../analyzer-agent-harness/src/harness/service.py)) | Sessions, file sync, uploads, chat routing, summary, fix requests. |
+| ScanManager ([scans.py](../analyzer-agent-harness/src/harness/scans.py)) | Runs scans as background asyncio tasks and publishes progress and partial findings. |
 | Scanners (`harness/scanners/`) | Semgrep, Gitleaks and SonarScanner run in parallel; results are merged. |
-| LLM ([llm.py](analyzer-agent-harness/src/harness/llm.py)) | Reviews findings, routes chat, answers questions, runs the fix agent. |
+| LLM ([llm.py](../analyzer-agent-harness/src/harness/llm.py)) | Reviews findings, routes chat, answers questions, runs the fix agent. |
 
 ## 2. Connecting
 
@@ -65,7 +65,7 @@ sequenceDiagram
 
 - Tokens are made on the server with `harness-token <user>`; each one maps to one user.
 - `connect()` finishes the connection first, then loads sessions through `ready()`.
-- With `vulnScanner.caCertificate` set, both MCP and uploads trust that CA ([http.ts](vscode-extension/src/http.ts)).
+- With `vulnScanner.caCertificate` set, both MCP and uploads trust that CA ([http.ts](../vscode-extension/src/http.ts)).
 
 ## 3. Chat decides what happens
 
@@ -96,7 +96,7 @@ flowchart TD
 ```
 
 - Only the extension can upload files or change the workspace, so scans and fixes come back as actions that the extension carries out.
-- If `chat` fails with an LLM error, `keywordAction` ([routing.ts](vscode-extension/src/routing.ts)) recognises plain scan commands so scanning still works.
+- If `chat` fails with an LLM error, `keywordAction` ([routing.ts](../vscode-extension/src/routing.ts)) recognises plain scan commands so scanning still works.
 - The only scan button is **Rescan**. It lights up after you save a file that has findings.
 
 ## 4. Workspace scan: sync and upload
