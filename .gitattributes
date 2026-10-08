@@ -1,0 +1,4 @@
+# Keep LF line endings on Windows checkouts: bash scripts and files copied into the Linux image break with CRLF.
+* text=auto eol=lf
+*.png binary
+*.vsix binary

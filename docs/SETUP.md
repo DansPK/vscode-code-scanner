@@ -10,6 +10,8 @@ How to run the scanner harness in Docker, connect an LLM and SonarQube, and inst
 ./setup.sh                                  # does everything else
 ```
 
+It works on Linux, macOS and Windows. On Windows, run it in **Git Bash** (part of [Git for Windows](https://git-scm.com/download/win)), not PowerShell or cmd. It finds Python as `python3`, `python` or `py -3`, and writes VS Code's settings in the right place for each system.
+
 The script generates the signing secret and the SearXNG secret (for the agents' web search), picks free ports, writing an override file if 8080 or 9000 are taken. It starts SonarQube and creates its token, builds and starts the harness, and checks the LLM. It then creates your user token, and builds and installs the extension with the server URL and token set in VS Code. It is safe to run again: it keeps a valid SonarQube token and an existing user token.
 
 Options: `HARNESS_USER=alice` (default: your login name), `NEW_TOKEN=1` (replace your token), `SONAR_ADMIN_PASSWORD=...` (if you changed SonarQube's admin password). On Linux it may ask for `sudo` to raise `vm.max_map_count`.
@@ -40,7 +42,7 @@ Fill in `.env`:
 | --- | --- | --- |
 | `HARNESS_PUBLIC_URL` | The URL VS Code uses to reach the harness. Upload links are built from it, so the host port must match. | `http://localhost:8080` |
 | `HARNESS_SIGNING_SECRET` | A long random string that signs upload links. Never keep the placeholder. | `openssl rand -hex 32` |
-| `LLM_BASE_URL` | Your LLM server's `/v1` URL, as seen from inside the container. For a server on the Docker host, use `host.docker.internal`. | `http://192.168.1.20:9302/v1` |
+| `LLM_BASE_URL` | Your LLM server's `/v1` URL, as seen from inside the container. For a server on the Docker host, use `host.docker.internal` (the compose file maps it on Linux too). | `http://192.168.1.20:9302/v1` |
 | `LLM_API_KEY` | The server's key, or any text if it needs none | `not-needed` |
 | `LLM_MODEL` | `openai/` followed by the model id the server lists | `openai/deephat-v1-7b` |
 | `SONAR_TOKEN` | Leave empty for now. You create it in step 3. | |

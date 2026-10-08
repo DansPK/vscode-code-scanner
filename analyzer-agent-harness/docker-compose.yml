@@ -14,6 +14,9 @@ services:
       - harness-data:/data
       # TLS certificate and key, if HARNESS_TLS_CERT/HARNESS_TLS_KEY point here (scripts/make_dev_cert.sh)
       - ./certs:/certs:ro
+    # Lets LLM_BASE_URL use host.docker.internal on Linux too (Docker Desktop has it already).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - sonarqube
       - searxng
